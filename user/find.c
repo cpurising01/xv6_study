@@ -1,0 +1,92 @@
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "user/user.h"
+#include "kernel/fs.h"
+
+// 辅助函数：获取文件路径中的文件名部分
+char*
+get_basename(char *path)
+{
+  char *p;
+  for(p = path + strlen(path); p >= path && *p != '/'; p--)
+    ;
+  return p + 1;
+}
+
+void
+find(char *path, char *target)
+{
+  char buf[512], *p;
+  int fd;
+  struct dirent de;
+  struct stat st;
+
+  if((fd = open(path, 0)) < 0){
+    fprintf(2, "find: cannot open %s\n", path);
+    return;
+  }
+
+  if(fstat(fd, &st) < 0){
+    fprintf(2, "find: cannot stat %s\n", path);
+    close(fd);
+    return;
+  }
+
+  switch(st.type){
+  case T_FILE:
+    // 如果传入路径是文件，判断其文件名是否与 target 相同
+    if(strcmp(get_basename(path), target) == 0){
+      printf("%s\n", path);
+    }
+    break;
+
+  case T_DIR:
+    if(strlen(path) + 1 + DIRSIZ + 1 > sizeof buf){
+      printf("find: path too long\n");
+      break;
+    }
+    strcpy(buf, path);
+    p = buf + strlen(buf);
+    *p++ = '/';
+    while(read(fd, &de, sizeof(de)) == sizeof(de)){
+      if(de.inum == 0)
+        continue;
+      
+      // 必须跳过 "." 和 ".." 目录，以防无限递归导致栈溢出
+      if(strcmp(de.name, ".") == 0 || strcmp(de.name, "..") == 0)
+        continue;
+      
+      // 拼接路径
+      memmove(p, de.name, DIRSIZ);
+      p[DIRSIZ] = 0; // 确保字符串零结尾
+
+      if(stat(buf, &st) < 0){
+        printf("find: cannot stat %s\n", buf);
+        continue;
+      }
+
+      // 如果文件名与目标名字相同，则打印该文件的完整路径
+      if(strcmp(de.name, target) == 0){
+        printf("%s\n", buf);
+      }
+
+      // 如果是目录，则递归搜寻
+      if(st.type == T_DIR){
+        find(buf, target);
+      }
+    }
+    break;
+  }
+  close(fd);
+}
+
+int
+main(int argc, char *argv[])
+{
+  if(argc != 3){
+    fprintf(2, "Usage: find <path> <filename>\n");
+    exit(1);
+  }
+  find(argv[1], argv[2]);
+  exit(0);
+}
