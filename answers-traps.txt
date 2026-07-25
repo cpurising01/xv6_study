@@ -1,0 +1,23 @@
+1. Which registers contain arguments to functions? For example, which register holds 13 in main's call to printf?
+Arguments to functions are passed in registers a0 through a7. In main's call to printf, 13 is loaded into register a2.
+
+2. Where is the call to function f in the assembly code for main? Where is the call to g? (Hint: the compiler may inline functions.)
+There are no physical function calls to f or g in main's assembly code. The compiler optimized and inlined both f and g directly into main, calculating the result (f(8)+1 = 12) at compile time and loading it directly into register a1.
+
+3. At what address is the function printf located?
+The function printf is located at address 0x0000000000000616.
+
+4. What value is in the register ra just after the jalr to printf in main?
+The register ra will contain 0x38, which is the address of the instruction immediately following the jalr (0x34 + 4).
+
+5. Run the following code.
+   unsigned int i = 0x00646c72;
+   printf("H%x Wo%s", 57616, &i);
+What is the output?
+The output is "He110 World". 57616 is 0xe110 in hex, and i is stored in memory (little-endian) as the ASCII bytes 'r' (0x72), 'l' (0x6c), 'd' (0x64), '\0' (0x00).
+
+6. The output depends on that fact that the RISC-V is little-endian. If the RISC-V were instead big-endian what would you set i to in order to yield the same output? Would you need to change 57616 to a different value?
+On a big-endian machine, i should be set to 0x726c6400 to lay out 'r', 'l', 'd', '\0' in that order in memory. You would not need to change 57616 to a different value because it is passed by value (held in register a1 directly), not by pointer reference, so memory endianness does not affect it.
+
+7. In the following code, what is going to be printed after 'y='? (note: the answer is not a specific value.) Why does this happen?
+It will print whatever garbage value happens to be in register a2 at the time of the printf call. This is because printf expects the value for the second format specifier (%d) to be in register a2, but no corresponding argument was passed to printf to populate a2.
