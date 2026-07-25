@@ -1,0 +1,10 @@
+1. Which other xv6 system call(s) could be made faster using this shared page? Explain how.
+Answer:
+The `uptime` system call can be made faster. The kernel keeps track of the tick count in the `ticks` variable. By mapping a read-only page containing the current ticks value to the user space, the user program can directly read the value without performing a context switch to the kernel.
+
+2. Explain the output of vmprint in terms of Fig 3-4 from the text. What does page 0 contain? What is in page 2? When running in user mode, could the process read/write the memory mapped by page 1? What does the third to last page contain?
+Answer:
+- Page 0 contains the user program's code (text segment) and data segment.
+- Page 2 contains the user stack.
+- When running in user mode, the process cannot read or write the memory mapped by page 1. Page 1 is an unmapped guard page (with PTE_V = 0) to prevent the user stack from overflowing into other pages. Any access to it will trigger a page fault.
+- The third to last page (at virtual address USYSCALL) contains the shared usyscall struct containing the process's PID. Above it are the TRAPFRAME page (second to last) and the TRAMPOLINE page (last).
