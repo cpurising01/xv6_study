@@ -65,6 +65,31 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if(r_scause() == 15){
+    // Store page fault — check for COW page
+    uint64 fault_va = r_stval();
+    pte_t *pte;
+    uint64 pa;
+
+    if(fault_va >= MAXVA || (pte = walk(p->pagetable, fault_va, 0)) == 0)
+      p->killed = 1;
+    else if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
+      p->killed = 1;
+    else if((*pte & PTE_RSW) == 0)
+      p->killed = 1;
+    else {
+      // COW page fault — allocate new page and copy
+      pa = PTE2PA(*pte);
+      char *mem = kalloc();
+      if(mem == 0) {
+        p->killed = 1;
+      } else {
+        memmove(mem, (char*)pa, PGSIZE);
+        uint flags = (PTE_FLAGS(*pte) & ~PTE_RSW) | PTE_W;
+        *pte = PA2PTE(mem) | flags | PTE_V;
+        kfree((void*)pa);
+      }
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {

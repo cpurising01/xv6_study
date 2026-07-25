@@ -23,10 +23,18 @@ struct {
   struct run *freelist;
 } kmem;
 
+// Reference count for each physical page
+// Indexed by (pa - KERNBASE) / PGSIZE
+#define REFCNT_PGN(pa) (((uint64)(pa) - KERNBASE) / PGSIZE)
+#define REFCNT_MAX_PGN ((PHYSTOP - KERNBASE) / PGSIZE)
+int refcnt[REFCNT_MAX_PGN];
+struct spinlock refcnt_lock;
+
 void
 kinit()
 {
   initlock(&kmem.lock, "kmem");
+  initlock(&refcnt_lock, "refcnt");
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -50,6 +58,16 @@ kfree(void *pa)
 
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
+
+  int pgn = REFCNT_PGN(pa);
+  acquire(&refcnt_lock);
+  if(refcnt[pgn] > 0)
+    refcnt[pgn]--;
+  int need_free = (refcnt[pgn] == 0);
+  release(&refcnt_lock);
+
+  if(!need_free)
+    return;
 
   // Fill with junk to catch dangling refs.
   memset(pa, 1, PGSIZE);
@@ -76,7 +94,21 @@ kalloc(void)
     kmem.freelist = r->next;
   release(&kmem.lock);
 
-  if(r)
+  if(r) {
     memset((char*)r, 5, PGSIZE); // fill with junk
+    int pgn = REFCNT_PGN(r);
+    acquire(&refcnt_lock);
+    refcnt[pgn] = 1;
+    release(&refcnt_lock);
+  }
   return (void*)r;
+}
+
+void
+incref(void *pa)
+{
+  int pgn = REFCNT_PGN(pa);
+  acquire(&refcnt_lock);
+  refcnt[pgn]++;
+  release(&refcnt_lock);
 }
