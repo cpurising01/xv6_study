@@ -1,0 +1,14 @@
+1. Why are there missing keys with 2 threads, but not with 1 thread?
+Because two threads can run the `put` function concurrently and hash to the same bucket. In `put`, if the key is not already present, it calls `insert(key, value, &table[i], table[i])`. 
+
+Suppose two threads, Thread A and Thread B, concurrently call `put` with keys that hash to the same bucket `i`, and the current head of the list is `N0`.
+- Thread A reads `table[i]` (which is `N0`) and passes it as `n` to `insert`. In `insert`, it allocates a new entry `EA` and sets `EA->next = N0`.
+- Before Thread A writes `EA` back to `table[i]`, a context switch occurs and Thread B runs.
+- Thread B reads `table[i]` (still `N0` because Thread A hasn't written `EA` to it yet) and passes it to `insert`. It allocates `EB` and sets `EB->next = N0`.
+- Thread A resumes and writes `table[i] = EA`.
+- Thread B resumes and writes `table[i] = EB`.
+
+Now, `table[i]` points to `EB`, and `EB->next` points to `N0`. The entry `EA` inserted by Thread A is lost, causing the key to be missing.
+
+2. Identify a sequence of events with 2 threads that can lead to a key being missing.
+Refer to the step-by-step trace above where Thread A and Thread B race on updating `table[i]`, resulting in one of the updates overwriting the other, leading to a lost entry.
