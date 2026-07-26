@@ -5,6 +5,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "sleeplock.h"
+#include "fs.h"
+#include "file.h"
 
 struct spinlock tickslock;
 uint ticks;
@@ -65,6 +68,39 @@ usertrap(void)
     intr_on();
 
     syscall();
+  } else if(r_scause() == 13 || r_scause() == 15){
+    uint64 va = r_stval();
+    struct vma *pvma = 0;
+    int i = 0;
+    if((va >= p->sz) || (va < PGROUNDDOWN(p->trapframe->sp))){
+      p->killed = 1;
+    } else {
+      va = PGROUNDDOWN(va);
+      for(; i < MAXVMA; i++){
+        pvma = &p->vma_table[i];
+        if(pvma->mapped && va >= pvma->addr && va < pvma->addr + pvma->len){
+          break;
+        }
+      }
+      if(i >= MAXVMA){
+        p->killed = 1;
+      } else {
+        char *mem = kalloc();
+        if(mem == 0){
+          p->killed = 1;
+        } else {
+          memset(mem, 0, PGSIZE);
+          if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, (pvma->prot << 1) | PTE_U) != 0){
+            kfree(mem);
+            p->killed = 1;
+          } else {
+            ilock(pvma->f->ip);
+            readi(pvma->f->ip, 1, va, va - pvma->addr + pvma->offset, PGSIZE);
+            iunlock(pvma->f->ip);
+          }
+        }
+      }
+    }
   } else if((which_dev = devintr()) != 0){
     // ok
   } else {

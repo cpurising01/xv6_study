@@ -484,3 +484,103 @@ sys_pipe(void)
   }
   return 0;
 }
+
+#ifndef min
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+uint64
+sys_mmap(void)
+{
+  struct proc *p = myproc();
+  uint64 addr;
+  int len;
+  int prot;
+  int flags;
+  int offset;
+  struct file *f;
+  if(argaddr(0, &addr) < 0 || argfd(4, 0, &f) < 0){
+    return -1;
+  }
+  if(argint(1, &len) < 0 || argint(2, &prot) < 0 || argint(3, &flags) < 0 || argint(5, &offset) < 0){
+    return -1;
+  }
+  if(!f->writable && (prot & PROT_WRITE) && flags == MAP_SHARED) 
+    return -1;
+  for(int i = 0; i < MAXVMA; i++){
+    if(p->vma_table[i].mapped == 0){
+      p->vma_table[i].mapped = 1;
+      p->vma_table[i].addr = p->sz;
+      p->vma_table[i].len = PGROUNDUP(len);
+      p->vma_table[i].prot = prot;
+      p->vma_table[i].flags = flags;
+      p->vma_table[i].offset = offset;
+      p->vma_table[i].f = filedup(f);
+      p->sz += PGROUNDUP(len);
+      return p->vma_table[i].addr;
+    }
+  }
+  return -1;
+}
+
+uint64
+munmap(uint64 addr, int len){
+  struct proc *p = myproc();
+  struct vma *pvma = 0;
+  int i = 0;
+  for(; i < MAXVMA; i++){
+    if(p->vma_table[i].mapped == 1 && addr >= p->vma_table[i].addr && (addr + len) <= (p->vma_table[i].addr + p->vma_table[i].len)){
+      pvma = &p->vma_table[i];
+      break;
+    }
+  }
+  if(pvma == 0){
+    return -1;
+  }
+  uint64 end = addr + len;
+  uint64 _addr = addr;
+  if((pvma->flags == MAP_SHARED) && pvma->f->writable){
+    uint64 cur = addr;
+    while(cur < end){
+      pte_t *pte = walk(p->pagetable, cur, 0);
+      if(pte && (*pte & PTE_V)){
+        int size = min(end - cur, PGSIZE);
+        begin_op();
+        ilock(pvma->f->ip);
+        if(writei(pvma->f->ip, 1, cur, cur - pvma->addr, size) != size){
+          iunlock(pvma->f->ip);
+          end_op();
+          return -1;
+        }
+        iunlock(pvma->f->ip);
+        end_op();
+      }
+      cur += PGSIZE;
+    }
+  }
+  uvmunmap(p->pagetable, _addr, PGROUNDUP(len) / PGSIZE, 1);
+
+  if(_addr == pvma->addr){
+    pvma->addr += len;
+    pvma->len -= len;
+  }else if(_addr + len == pvma->addr + pvma->len){
+    pvma->len -= len;
+  }
+
+  if(pvma->len == 0 && pvma->mapped == 1){
+    fileclose(pvma->f);
+    pvma->mapped = 0;
+  }
+  return 0;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr;
+  int len;
+  if(argaddr(0, &addr) < 0 || argint(1, &len) < 0){
+    return -1;
+  }
+  return munmap(addr, len);
+}
