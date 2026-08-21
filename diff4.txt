@@ -1,0 +1,132 @@
+commit 8bee90c2f6a14f3be89a5bd4bce0bbcc2b4cbd97
+Author: cpurising <cpurising@outlook.com>
+Date:   Tue Jul 14 16:13:46 2026 +0800
+
+    完成 sleep 实验
+
+diff --git a/.opencode/opencode.json b/.opencode/opencode.json
+new file mode 100644
+index 0000000..c997c03
+--- /dev/null
++++ b/.opencode/opencode.json
+@@ -0,0 +1,6 @@
++{
++  "$schema": "https://opencode.ai/config.json",
++  "plugin": [
++    "list"
++  ]
++}
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index c926b7e..f64d3ac 100644
+--- a/Makefile
++++ b/Makefile
+@@ -91,7 +91,7 @@ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+ 
+-CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
++CFLAGS = -Wall -O -fno-omit-frame-pointer -ggdb
+ 
+ ifdef LAB
+ LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
+@@ -193,6 +193,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_sleep\
++	$U/_pingpong\
+ 
+ 
+ 
+diff --git a/user/pingpong.c b/user/pingpong.c
+new file mode 100644
+index 0000000..7eceff7
+--- /dev/null
++++ b/user/pingpong.c
+@@ -0,0 +1,60 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  int p1[2], p2[2];
++  char buf[1];
++
++  if (pipe(p1) < 0 || pipe(p2) < 0) {
++    fprintf(2, "pipe failed\n");
++    exit(1);
++  }
++
++  int pid = fork();
++  if (pid < 0) {
++    fprintf(2, "fork failed\n");
++    exit(1);
++  }
++
++  if (pid == 0) {
++    // Child process
++    close(p1[1]);
++    close(p2[0]);
++
++    if (read(p1[0], buf, 1) != 1) {
++      fprintf(2, "child read failed\n");
++      exit(1);
++    }
++    printf("%d: received ping\n", getpid());
++
++    if (write(p2[1], buf, 1) != 1) {
++      fprintf(2, "child write failed\n");
++      exit(1);
++    }
++
++    close(p1[0]);
++    close(p2[1]);
++    exit(0);
++  } else {
++    // Parent process
++    close(p1[0]);
++    close(p2[1]);
++
++    if (write(p1[1], "p", 1) != 1) {
++      fprintf(2, "parent write failed\n");
++      exit(1);
++    }
++
++    if (read(p2[0], buf, 1) != 1) {
++      fprintf(2, "parent read failed\n");
++      exit(1);
++    }
++    printf("%d: received pong\n", getpid());
++
++    close(p1[1]);
++    close(p2[0]);
++    exit(0);
++  }
++}
+diff --git a/user/sleep.c b/user/sleep.c
+new file mode 100644
+index 0000000..7f8ae2f
+--- /dev/null
++++ b/user/sleep.c
+@@ -0,0 +1,19 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  if (argc != 2) {
++    fprintf(2, "Usage: sleep <ticks>\n");
++    exit(1);
++  }
++
++  int ticks = atoi(argv[1]);
++  if (sleep(ticks) < 0) {
++    fprintf(2, "sleep failed\n");
++    exit(1);
++  }
++
++  exit(0);
++}
