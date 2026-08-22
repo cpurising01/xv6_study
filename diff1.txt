@@ -1,0 +1,219 @@
+commit e5632af086b8d23de2a622856ed0af5c38da5860
+Author: CPU-rising <cpu@rising.com>
+Date:   Sat Jul 25 13:33:17 2026 +0800
+
+    Finish Lab 03 page tables
+
+diff --git a/answers-pgtbl.txt b/answers-pgtbl.txt
+new file mode 100644
+index 0000000..e9139e7
+--- /dev/null
++++ b/answers-pgtbl.txt
+@@ -0,0 +1,10 @@
++1. Which other xv6 system call(s) could be made faster using this shared page? Explain how.
++Answer:
++The `uptime` system call can be made faster. The kernel keeps track of the tick count in the `ticks` variable. By mapping a read-only page containing the current ticks value to the user space, the user program can directly read the value without performing a context switch to the kernel.
++
++2. Explain the output of vmprint in terms of Fig 3-4 from the text. What does page 0 contain? What is in page 2? When running in user mode, could the process read/write the memory mapped by page 1? What does the third to last page contain?
++Answer:
++- Page 0 contains the user program's code (text segment) and data segment.
++- Page 2 contains the user stack.
++- When running in user mode, the process cannot read or write the memory mapped by page 1. Page 1 is an unmapped guard page (with PTE_V = 0) to prevent the user stack from overflowing into other pages. Any access to it will trigger a page fault.
++- The third to last page (at virtual address USYSCALL) contains the shared usyscall struct containing the process's PID. Above it are the TRAPFRAME page (second to last) and the TRAMPOLINE page (last).
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..d3b29ec 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -170,6 +170,8 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++void            vmprint(pagetable_t);
++pte_t *         walk(pagetable_t, uint64, int);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/exec.c b/kernel/exec.c
+index d62d29d..a935713 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -116,6 +116,10 @@ exec(char *path, char **argv)
+   p->trapframe->sp = sp; // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
+ 
++  if(p->pid == 1){
++    vmprint(p->pagetable);
++  }
++
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..77507c9 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -127,6 +127,14 @@ found:
+     return 0;
+   }
+ 
++  // Allocate a usyscall page.
++  if((p->usyscall = (struct usyscall *)kalloc()) == 0){
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++  p->usyscall->pid = p->pid;
++
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+@@ -153,6 +161,9 @@ freeproc(struct proc *p)
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
++  if(p->usyscall)
++    kfree((void*)p->usyscall);
++  p->usyscall = 0;
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+@@ -196,6 +207,15 @@ proc_pagetable(struct proc *p)
+     return 0;
+   }
+ 
++  // map the usyscall page just below TRAPFRAME, for ugetpid().
++  if(mappages(pagetable, USYSCALL, PGSIZE,
++              (uint64)(p->usyscall), PTE_R | PTE_U) < 0){
++    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++    uvmunmap(pagetable, TRAPFRAME, 1, 0);
++    uvmfree(pagetable, 0);
++    return 0;
++  }
++
+   return pagetable;
+ }
+ 
+@@ -206,6 +226,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
+ {
+   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+   uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmunmap(pagetable, USYSCALL, 1, 0);
+   uvmfree(pagetable, sz);
+ }
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..30fd4b8 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -101,6 +101,7 @@ struct proc {
+   uint64 sz;                   // Size of process memory (bytes)
+   pagetable_t pagetable;       // User page table
+   struct trapframe *trapframe; // data page for trampoline.S
++  struct usyscall *usyscall;   // USYSCALL page (pid read-only optimization)
+   struct context context;      // swtch() here to run process
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 1691faf..abc1d88 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -343,6 +343,7 @@ sfence_vma()
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
++#define PTE_A (1L << 6) // accessed
+ 
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3bd0007..5f80c75 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -80,7 +80,33 @@ sys_sleep(void)
+ int
+ sys_pgaccess(void)
+ {
+-  // lab pgtbl: your code here.
++  uint64 va;
++  int pages;
++  uint64 user_addr;
++
++  if(argaddr(0, &va) < 0 || argint(1, &pages) < 0 || argaddr(2, &user_addr) < 0)
++    return -1;
++
++  if(pages < 0 || pages > 32)
++    return -1;
++
++  struct proc *p = myproc();
++  uint32 abits = 0;
++
++  for(int i = 0; i < pages; i++) {
++    uint64 page_va = va + i * PGSIZE;
++    pte_t *pte = walk(p->pagetable, page_va, 0);
++    if(pte != 0 && (*pte & PTE_V) != 0) {
++      if(*pte & PTE_A) {
++        abits |= (1 << i);
++        *pte &= ~PTE_A;
++      }
++    }
++  }
++
++  if(copyout(p->pagetable, user_addr, (char *)&abits, sizeof(abits)) < 0)
++    return -1;
++
+   return 0;
+ }
+ #endif
+diff --git a/kernel/vm.c b/kernel/vm.c
+index d5a12a0..7700445 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -432,3 +432,28 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++void
++vmprint_helper(pagetable_t pagetable, int level)
++{
++  for(int i = 0; i < 512; i++){
++    pte_t pte = pagetable[i];
++    if(pte & PTE_V){
++      for(int j = 0; j < level; j++){
++        printf(" ..");
++      }
++      printf("%d: pte %p pa %p\n", i, pte, PTE2PA(pte));
++      if((pte & (PTE_R|PTE_W|PTE_X)) == 0){
++        uint64 child = PTE2PA(pte);
++        vmprint_helper((pagetable_t)child, level + 1);
++      }
++    }
++  }
++}
++
++void
++vmprint(pagetable_t pagetable)
++{
++  printf("page table %p\n", pagetable);
++  vmprint_helper(pagetable, 1);
++}
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..7ed6ff8
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++5
+diff --git a/user/sh.c b/user/sh.c
+index 83dd513..7106fe0 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -54,7 +54,7 @@ void panic(char*);
+ struct cmd *parsecmd(char*);
+ 
+ // Execute cmd.  Never returns.
+-void
++void __attribute__((noreturn))
+ runcmd(struct cmd *cmd)
+ {
+   int p[2];
