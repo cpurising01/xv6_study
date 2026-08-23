@@ -1,0 +1,188 @@
+commit 89f716397c3d03b719644cb755b8ad467d73a78c
+Author: CPU-rising <cpu@rising.com>
+Date:   Sat Jul 25 14:45:12 2026 +0800
+
+    Finish Lab 6: Multithreading
+
+diff --git a/answers-thread.txt b/answers-thread.txt
+new file mode 100644
+index 0000000..bc0a475
+--- /dev/null
++++ b/answers-thread.txt
+@@ -0,0 +1,14 @@
++1. Why are there missing keys with 2 threads, but not with 1 thread?
++Because two threads can run the `put` function concurrently and hash to the same bucket. In `put`, if the key is not already present, it calls `insert(key, value, &table[i], table[i])`. 
++
++Suppose two threads, Thread A and Thread B, concurrently call `put` with keys that hash to the same bucket `i`, and the current head of the list is `N0`.
++- Thread A reads `table[i]` (which is `N0`) and passes it as `n` to `insert`. In `insert`, it allocates a new entry `EA` and sets `EA->next = N0`.
++- Before Thread A writes `EA` back to `table[i]`, a context switch occurs and Thread B runs.
++- Thread B reads `table[i]` (still `N0` because Thread A hasn't written `EA` to it yet) and passes it to `insert`. It allocates `EB` and sets `EB->next = N0`.
++- Thread A resumes and writes `table[i] = EA`.
++- Thread B resumes and writes `table[i] = EB`.
++
++Now, `table[i]` points to `EB`, and `EB->next` points to `N0`. The entry `EA` inserted by Thread A is lost, causing the key to be missing.
++
++2. Identify a sequence of events with 2 threads that can lead to a key being missing.
++Refer to the step-by-step trace above where Thread A and Thread B race on updating `table[i]`, resulting in one of the updates overwriting the other, leading to a lost entry.
+diff --git a/notxv6/barrier.c b/notxv6/barrier.c
+index 12793e8..d568869 100644
+--- a/notxv6/barrier.c
++++ b/notxv6/barrier.c
+@@ -25,12 +25,16 @@ barrier_init(void)
+ static void 
+ barrier()
+ {
+-  // YOUR CODE HERE
+-  //
+-  // Block until all threads have called barrier() and
+-  // then increment bstate.round.
+-  //
+-  
++  pthread_mutex_lock(&bstate.barrier_mutex);
++  bstate.nthread++;
++  if (bstate.nthread == nthread) {
++    bstate.round++;
++    bstate.nthread = 0;
++    pthread_cond_broadcast(&bstate.barrier_cond);
++  } else {
++    pthread_cond_wait(&bstate.barrier_cond, &bstate.barrier_mutex);
++  }
++  pthread_mutex_unlock(&bstate.barrier_mutex);
+ }
+ 
+ static void *
+diff --git a/notxv6/ph.c b/notxv6/ph.c
+index 82afe76..dfb79d4 100644
+--- a/notxv6/ph.c
++++ b/notxv6/ph.c
+@@ -14,6 +14,7 @@ struct entry {
+   struct entry *next;
+ };
+ struct entry *table[NBUCKET];
++pthread_mutex_t locks[NBUCKET];
+ int keys[NKEYS];
+ int nthread = 1;
+ 
+@@ -42,6 +43,7 @@ void put(int key, int value)
+   int i = key % NBUCKET;
+ 
+   // is the key already present?
++  pthread_mutex_lock(&locks[i]);
+   struct entry *e = 0;
+   for (e = table[i]; e != 0; e = e->next) {
+     if (e->key == key)
+@@ -54,7 +56,7 @@ void put(int key, int value)
+     // the new is new.
+     insert(key, value, &table[i], table[i]);
+   }
+-
++  pthread_mutex_unlock(&locks[i]);
+ }
+ 
+ static struct entry*
+@@ -113,6 +115,9 @@ main(int argc, char *argv[])
+   nthread = atoi(argv[1]);
+   tha = malloc(sizeof(pthread_t) * nthread);
+   srandom(0);
++  for (int i = 0; i < NBUCKET; i++) {
++    pthread_mutex_init(&locks[i], NULL);
++  }
+   assert(NKEYS % nthread == 0);
+   for (int i = 0; i < NKEYS; i++) {
+     keys[i] = random();
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..b8626c4
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++4
+diff --git a/user/uthread.c b/user/uthread.c
+index 06349f5..618ba1f 100644
+--- a/user/uthread.c
++++ b/user/uthread.c
+@@ -11,9 +11,27 @@
+ #define MAX_THREAD  4
+ 
+ 
++struct context {
++  uint64 ra;
++  uint64 sp;
++  uint64 s0;
++  uint64 s1;
++  uint64 s2;
++  uint64 s3;
++  uint64 s4;
++  uint64 s5;
++  uint64 s6;
++  uint64 s7;
++  uint64 s8;
++  uint64 s9;
++  uint64 s10;
++  uint64 s11;
++};
++
+ struct thread {
+   char       stack[STACK_SIZE]; /* the thread's stack */
+   int        state;             /* FREE, RUNNING, RUNNABLE */
++  struct context context;       /* saved registers for context switch */
+ };
+ struct thread all_thread[MAX_THREAD];
+ struct thread *current_thread;
+@@ -62,6 +80,7 @@ thread_schedule(void)
+      * Invoke thread_switch to switch from t to next_thread:
+      * thread_switch(??, ??);
+      */
++    thread_switch((uint64)&t->context, (uint64)&current_thread->context);
+   } else
+     next_thread = 0;
+ }
+@@ -76,6 +95,8 @@ thread_create(void (*func)())
+   }
+   t->state = RUNNABLE;
+   // YOUR CODE HERE
++  t->context.sp = (uint64)&t->stack[STACK_SIZE];
++  t->context.ra = (uint64)func;
+ }
+ 
+ void 
+diff --git a/user/uthread_switch.S b/user/uthread_switch.S
+index 5defb12..0eb0a2c 100644
+--- a/user/uthread_switch.S
++++ b/user/uthread_switch.S
+@@ -7,5 +7,34 @@
+ 
+ 	.globl thread_switch
+ thread_switch:
+-	/* YOUR CODE HERE */
++	sd ra, 0(a0)
++	sd sp, 8(a0)
++	sd s0, 16(a0)
++	sd s1, 24(a0)
++	sd s2, 32(a0)
++	sd s3, 40(a0)
++	sd s4, 48(a0)
++	sd s5, 56(a0)
++	sd s6, 64(a0)
++	sd s7, 72(a0)
++	sd s8, 80(a0)
++	sd s9, 88(a0)
++	sd s10, 96(a0)
++	sd s11, 104(a0)
++
++	ld ra, 0(a1)
++	ld sp, 8(a1)
++	ld s0, 16(a1)
++	ld s1, 24(a1)
++	ld s2, 32(a1)
++	ld s3, 40(a1)
++	ld s4, 48(a1)
++	ld s5, 56(a1)
++	ld s6, 64(a1)
++	ld s7, 72(a1)
++	ld s8, 80(a1)
++	ld s9, 88(a1)
++	ld s10, 96(a1)
++	ld s11, 104(a1)
++
+ 	ret    /* return to ra */
