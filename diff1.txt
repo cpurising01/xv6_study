@@ -1,0 +1,7663 @@
+commit 2d6e4364d0bc917bb9d3bbbd476cabc394eb4ae2
+Author: CPU-rising <cpu@rising.com>
+Date:   Sat Jul 25 14:10:28 2026 +0800
+
+    Finish Lab 04 traps
+
+diff --git a/Makefile b/Makefile
+index 7a7e380..f61d966 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,409 +1,410 @@
+-
+-# To compile and run with a lab solution, set the lab name in lab.mk
+-# (e.g., LAB=util).  Run make grade to test solution with the lab's
+-# grade script (e.g., grade-lab-util).
+-
+--include conf/lab.mk
+-
+-K=kernel
+-U=user
+-
+-OBJS = \
+-  $K/entry.o \
+-  $K/kalloc.o \
+-  $K/string.o \
+-  $K/main.o \
+-  $K/vm.o \
+-  $K/proc.o \
+-  $K/swtch.o \
+-  $K/trampoline.o \
+-  $K/trap.o \
+-  $K/syscall.o \
+-  $K/sysproc.o \
+-  $K/bio.o \
+-  $K/fs.o \
+-  $K/log.o \
+-  $K/sleeplock.o \
+-  $K/file.o \
+-  $K/pipe.o \
+-  $K/exec.o \
+-  $K/sysfile.o \
+-  $K/kernelvec.o \
+-  $K/plic.o \
+-  $K/virtio_disk.o
+-
+-OBJS_KCSAN = \
+-  $K/start.o \
+-  $K/console.o \
+-  $K/printf.o \
+-  $K/uart.o \
+-  $K/spinlock.o
+-
+-ifdef KCSAN
+-OBJS_KCSAN += \
+-	$K/kcsan.o
+-endif
+-
+-ifeq ($(LAB),$(filter $(LAB), lock))
+-OBJS += \
+-	$K/stats.o\
+-	$K/sprintf.o
+-endif
+-
+-
+-ifeq ($(LAB),net)
+-OBJS += \
+-	$K/e1000.o \
+-	$K/net.o \
+-	$K/sysnet.o \
+-	$K/pci.o
+-endif
+-
+-
+-# riscv64-unknown-elf- or riscv64-linux-gnu-
+-# perhaps in /opt/riscv/bin
+-#TOOLPREFIX = 
+-
+-# Try to infer the correct TOOLPREFIX if not set
+-ifndef TOOLPREFIX
+-TOOLPREFIX := $(shell if riscv64-unknown-elf-objdump -i 2>&1 | grep 'elf64-big' >/dev/null 2>&1; \
+-	then echo 'riscv64-unknown-elf-'; \
+-	elif riscv64-linux-gnu-objdump -i 2>&1 | grep 'elf64-big' >/dev/null 2>&1; \
+-	then echo 'riscv64-linux-gnu-'; \
+-	elif riscv64-unknown-linux-gnu-objdump -i 2>&1 | grep 'elf64-big' >/dev/null 2>&1; \
+-	then echo 'riscv64-unknown-linux-gnu-'; \
+-	else echo "***" 1>&2; \
+-	echo "*** Error: Couldn't find a riscv64 version of GCC/binutils." 1>&2; \
+-	echo "*** To turn off this error, run 'gmake TOOLPREFIX= ...'." 1>&2; \
+-	echo "***" 1>&2; exit 1; fi)
+-endif
+-
+-QEMU = qemu-system-riscv64
+-
+-CC = $(TOOLPREFIX)gcc
+-AS = $(TOOLPREFIX)gas
+-LD = $(TOOLPREFIX)ld
+-OBJCOPY = $(TOOLPREFIX)objcopy
+-OBJDUMP = $(TOOLPREFIX)objdump
+-
+-CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
+-
+-ifdef LAB
+-LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
+-XCFLAGS += -DSOL_$(LABUPPER) -DLAB_$(LABUPPER)
+-endif
+-
+-CFLAGS += $(XCFLAGS)
+-CFLAGS += -MD
+-CFLAGS += -mcmodel=medany
+-CFLAGS += -ffreestanding -fno-common -nostdlib -mno-relax
+-CFLAGS += -I.
+-CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+-
+-ifeq ($(LAB),net)
+-CFLAGS += -DNET_TESTS_PORT=$(SERVERPORT)
+-endif
+-
+-ifdef KCSAN
+-CFLAGS += -DKCSAN
+-KCSANFLAG = -fsanitize=thread
+-endif
+-
+-# Disable PIE when possible (for Ubuntu 16.10 toolchain)
+-ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
+-CFLAGS += -fno-pie -no-pie
+-endif
+-ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
+-CFLAGS += -fno-pie -nopie
+-endif
+-
+-LDFLAGS = -z max-page-size=4096
+-
+-$K/kernel: $(OBJS) $(OBJS_KCSAN) $K/kernel.ld $U/initcode
+-	$(LD) $(LDFLAGS) -T $K/kernel.ld -o $K/kernel $(OBJS) $(OBJS_KCSAN)
+-	$(OBJDUMP) -S $K/kernel > $K/kernel.asm
+-	$(OBJDUMP) -t $K/kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $K/kernel.sym
+-
+-$(OBJS): EXTRAFLAG := $(KCSANFLAG)
+-
+-$K/%.o: $K/%.c
+-	$(CC) $(CFLAGS) $(EXTRAFLAG) -c -o $@ $<
+-
+-
+-$U/initcode: $U/initcode.S
+-	$(CC) $(CFLAGS) -march=rv64g -nostdinc -I. -Ikernel -c $U/initcode.S -o $U/initcode.o
+-	$(LD) $(LDFLAGS) -N -e start -Ttext 0 -o $U/initcode.out $U/initcode.o
+-	$(OBJCOPY) -S -O binary $U/initcode.out $U/initcode
+-	$(OBJDUMP) -S $U/initcode.o > $U/initcode.asm
+-
+-tags: $(OBJS) _init
+-	etags *.S *.c
+-
+-ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o
+-
+-ifeq ($(LAB),$(filter $(LAB), lock))
+-ULIB += $U/statistics.o
+-endif
+-
+-_%: %.o $(ULIB)
+-	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
+-	$(OBJDUMP) -S $@ > $*.asm
+-	$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $*.sym
+-
+-$U/usys.S : $U/usys.pl
+-	perl $U/usys.pl > $U/usys.S
+-
+-$U/usys.o : $U/usys.S
+-	$(CC) $(CFLAGS) -c -o $U/usys.o $U/usys.S
+-
+-$U/_forktest: $U/forktest.o $(ULIB)
+-	# forktest has less library code linked in - needs to be small
+-	# in order to be able to max out the proc table.
+-	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $U/_forktest $U/forktest.o $U/ulib.o $U/usys.o
+-	$(OBJDUMP) -S $U/_forktest > $U/forktest.asm
+-
+-mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
+-	gcc $(XCFLAGS) -Werror -Wall -I. -o mkfs/mkfs mkfs/mkfs.c
+-
+-# Prevent deletion of intermediate files, e.g. cat.o, after first build, so
+-# that disk image changes after first build are persistent until clean.  More
+-# details:
+-# http://www.gnu.org/software/make/manual/html_node/Chained-Rules.html
+-.PRECIOUS: %.o
+-
+-UPROGS=\
+-	$U/_cat\
+-	$U/_echo\
+-	$U/_forktest\
+-	$U/_grep\
+-	$U/_init\
+-	$U/_kill\
+-	$U/_ln\
+-	$U/_ls\
+-	$U/_mkdir\
+-	$U/_rm\
+-	$U/_sh\
+-	$U/_stressfs\
+-	$U/_usertests\
+-	$U/_grind\
+-	$U/_wc\
+-	$U/_zombie\
+-
+-
+-
+-
+-ifeq ($(LAB),$(filter $(LAB), lock))
+-UPROGS += \
+-	$U/_stats
+-endif
+-
+-ifeq ($(LAB),traps)
+-UPROGS += \
+-	$U/_call\
+-	$U/_bttest
+-endif
+-
+-ifeq ($(LAB),lazy)
+-UPROGS += \
+-	$U/_lazytests
+-endif
+-
+-ifeq ($(LAB),cow)
+-UPROGS += \
+-	$U/_cowtest
+-endif
+-
+-ifeq ($(LAB),thread)
+-UPROGS += \
+-	$U/_uthread
+-
+-$U/uthread_switch.o : $U/uthread_switch.S
+-	$(CC) $(CFLAGS) -c -o $U/uthread_switch.o $U/uthread_switch.S
+-
+-$U/_uthread: $U/uthread.o $U/uthread_switch.o $(ULIB)
+-	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $U/_uthread $U/uthread.o $U/uthread_switch.o $(ULIB)
+-	$(OBJDUMP) -S $U/_uthread > $U/uthread.asm
+-
+-ph: notxv6/ph.c
+-	gcc -o ph -g -O2 $(XCFLAGS) notxv6/ph.c -pthread
+-
+-barrier: notxv6/barrier.c
+-	gcc -o barrier -g -O2 $(XCFLAGS) notxv6/barrier.c -pthread
+-endif
+-
+-ifeq ($(LAB),pgtbl)
+-UPROGS += \
+-	$U/_pgtbltest
+-endif
+-
+-ifeq ($(LAB),lock)
+-UPROGS += \
+-	$U/_kalloctest\
+-	$U/_bcachetest
+-endif
+-
+-ifeq ($(LAB),fs)
+-UPROGS += \
+-	$U/_bigfile
+-endif
+-
+-
+-
+-ifeq ($(LAB),net)
+-UPROGS += \
+-	$U/_nettests
+-endif
+-
+-UEXTRA=
+-ifeq ($(LAB),util)
+-	UEXTRA += user/xargstest.sh
+-endif
+-
+-
+-fs.img: mkfs/mkfs README $(UEXTRA) $(UPROGS)
+-	mkfs/mkfs fs.img README $(UEXTRA) $(UPROGS)
+-
+--include kernel/*.d user/*.d
+-
+-clean: 
+-	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
+-	*/*.o */*.d */*.asm */*.sym \
+-	$U/initcode $U/initcode.out $K/kernel fs.img \
+-	mkfs/mkfs .gdbinit \
+-        $U/usys.S \
+-	$(UPROGS) \
+-	ph barrier
+-
+-# try to generate a unique GDB port
+-GDBPORT = $(shell expr `id -u` % 5000 + 25000)
+-# QEMU's gdb stub command line changed in 0.11
+-QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+-	then echo "-gdb tcp::$(GDBPORT)"; \
+-	else echo "-s -p $(GDBPORT)"; fi)
+-ifndef CPUS
+-CPUS := 3
+-endif
+-ifeq ($(LAB),fs)
+-CPUS := 1
+-endif
+-
+-FWDPORT = $(shell expr `id -u` % 5000 + 25999)
+-
+-QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+-QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
+-QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
+-
+-ifeq ($(LAB),net)
+-QEMUOPTS += -netdev user,id=net0,hostfwd=udp::$(FWDPORT)-:2000 -object filter-dump,id=net0,netdev=net0,file=packets.pcap
+-QEMUOPTS += -device e1000,netdev=net0,bus=pcie.0
+-endif
+-
+-qemu: $K/kernel fs.img
+-	$(QEMU) $(QEMUOPTS)
+-
+-.gdbinit: .gdbinit.tmpl-riscv
+-	sed "s/:1234/:$(GDBPORT)/" < $^ > $@
+-
+-qemu-gdb: $K/kernel .gdbinit fs.img
+-	@echo "*** Now run 'gdb' in another window." 1>&2
+-	$(QEMU) $(QEMUOPTS) -S $(QEMUGDB)
+-
+-ifeq ($(LAB),net)
+-# try to generate a unique port for the echo server
+-SERVERPORT = $(shell expr `id -u` % 5000 + 25099)
+-
+-server:
+-	python3 server.py $(SERVERPORT)
+-
+-ping:
+-	python3 ping.py $(FWDPORT)
+-endif
+-
+-##
+-##  FOR testing lab grading script
+-##
+-
+-ifneq ($(V),@)
+-GRADEFLAGS += -v
+-endif
+-
+-print-gdbport:
+-	@echo $(GDBPORT)
+-
+-grade:
+-	@echo $(MAKE) clean
+-	@$(MAKE) clean || \
+-          (echo "'make clean' failed.  HINT: Do you have another running instance of xv6?" && exit 1)
+-	./grade-lab-$(LAB) $(GRADEFLAGS)
+-
+-##
+-## FOR web handin
+-##
+-
+-
+-WEBSUB := https://6828.scripts.mit.edu/2021/handin.py
+-
+-handin: tarball-pref myapi.key
+-	@SUF=$(LAB); \
+-	curl -f -F file=@lab-$$SUF-handin.tar.gz -F key=\<myapi.key $(WEBSUB)/upload \
+-	    > /dev/null || { \
+-		echo ; \
+-		echo Submit seems to have failed.; \
+-		echo Please go to $(WEBSUB)/ and upload the tarball manually.; }
+-
+-handin-check:
+-	@if ! test -d .git; then \
+-		echo No .git directory, is this a git repository?; \
+-		false; \
+-	fi
+-	@if test "$$(git symbolic-ref HEAD)" != refs/heads/$(LAB); then \
+-		git branch; \
+-		read -p "You are not on the $(LAB) branch.  Hand-in the current branch? [y/N] " r; \
+-		test "$$r" = y; \
+-	fi
+-	@if ! git diff-files --quiet || ! git diff-index --quiet --cached HEAD; then \
+-		git status -s; \
+-		echo; \
+-		echo "You have uncomitted changes.  Please commit or stash them."; \
+-		false; \
+-	fi
+-	@if test -n "`git status -s`"; then \
+-		git status -s; \
+-		read -p "Untracked files will not be handed in.  Continue? [y/N] " r; \
+-		test "$$r" = y; \
+-	fi
+-
+-UPSTREAM := $(shell git remote -v | grep -m 1 "xv6-labs-2021" | awk '{split($$0,a," "); print a[1]}')
+-
+-tarball: handin-check
+-	git archive --format=tar HEAD | gzip > lab-$(LAB)-handin.tar.gz
+-
+-tarball-pref: handin-check
+-	@SUF=$(LAB); \
+-	git archive --format=tar HEAD > lab-$$SUF-handin.tar; \
+-	git diff $(UPSTREAM)/$(LAB) > /tmp/lab-$$SUF-diff.patch; \
+-	tar -rf lab-$$SUF-handin.tar /tmp/lab-$$SUF-diff.patch; \
+-	gzip -c lab-$$SUF-handin.tar > lab-$$SUF-handin.tar.gz; \
+-	rm lab-$$SUF-handin.tar; \
+-	rm /tmp/lab-$$SUF-diff.patch; \
+-
+-myapi.key:
+-	@echo Get an API key for yourself by visiting $(WEBSUB)/
+-	@read -p "Please enter your API key: " k; \
+-	if test `echo "$$k" |tr -d '\n' |wc -c` = 32 ; then \
+-		TF=`mktemp -t tmp.XXXXXX`; \
+-		if test "x$$TF" != "x" ; then \
+-			echo "$$k" |tr -d '\n' > $$TF; \
+-			mv -f $$TF $@; \
+-		else \
+-			echo mktemp failed; \
+-			false; \
+-		fi; \
+-	else \
+-		echo Bad API key: $$k; \
+-		echo An API key should be 32 characters long.; \
+-		false; \
+-	fi;
+-
+-
+-.PHONY: handin tarball tarball-pref clean grade handin-check
++
++# To compile and run with a lab solution, set the lab name in lab.mk
++# (e.g., LAB=util).  Run make grade to test solution with the lab's
++# grade script (e.g., grade-lab-util).
++
++-include conf/lab.mk
++
++K=kernel
++U=user
++
++OBJS = \
++  $K/entry.o \
++  $K/kalloc.o \
++  $K/string.o \
++  $K/main.o \
++  $K/vm.o \
++  $K/proc.o \
++  $K/swtch.o \
++  $K/trampoline.o \
++  $K/trap.o \
++  $K/syscall.o \
++  $K/sysproc.o \
++  $K/bio.o \
++  $K/fs.o \
++  $K/log.o \
++  $K/sleeplock.o \
++  $K/file.o \
++  $K/pipe.o \
++  $K/exec.o \
++  $K/sysfile.o \
++  $K/kernelvec.o \
++  $K/plic.o \
++  $K/virtio_disk.o
++
++OBJS_KCSAN = \
++  $K/start.o \
++  $K/console.o \
++  $K/printf.o \
++  $K/uart.o \
++  $K/spinlock.o
++
++ifdef KCSAN
++OBJS_KCSAN += \
++	$K/kcsan.o
++endif
++
++ifeq ($(LAB),$(filter $(LAB), lock))
++OBJS += \
++	$K/stats.o\
++	$K/sprintf.o
++endif
++
++
++ifeq ($(LAB),net)
++OBJS += \
++	$K/e1000.o \
++	$K/net.o \
++	$K/sysnet.o \
++	$K/pci.o
++endif
++
++
++# riscv64-unknown-elf- or riscv64-linux-gnu-
++# perhaps in /opt/riscv/bin
++#TOOLPREFIX = 
++
++# Try to infer the correct TOOLPREFIX if not set
++ifndef TOOLPREFIX
++TOOLPREFIX := $(shell if riscv64-unknown-elf-objdump -i 2>&1 | grep 'elf64-big' >/dev/null 2>&1; \
++	then echo 'riscv64-unknown-elf-'; \
++	elif riscv64-linux-gnu-objdump -i 2>&1 | grep 'elf64-big' >/dev/null 2>&1; \
++	then echo 'riscv64-linux-gnu-'; \
++	elif riscv64-unknown-linux-gnu-objdump -i 2>&1 | grep 'elf64-big' >/dev/null 2>&1; \
++	then echo 'riscv64-unknown-linux-gnu-'; \
++	else echo "***" 1>&2; \
++	echo "*** Error: Couldn't find a riscv64 version of GCC/binutils." 1>&2; \
++	echo "*** To turn off this error, run 'gmake TOOLPREFIX= ...'." 1>&2; \
++	echo "***" 1>&2; exit 1; fi)
++endif
++
++QEMU = qemu-system-riscv64
++
++CC = $(TOOLPREFIX)gcc
++AS = $(TOOLPREFIX)gas
++LD = $(TOOLPREFIX)ld
++OBJCOPY = $(TOOLPREFIX)objcopy
++OBJDUMP = $(TOOLPREFIX)objdump
++
++CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb -Wno-infinite-recursion
++
++ifdef LAB
++LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
++XCFLAGS += -DSOL_$(LABUPPER) -DLAB_$(LABUPPER)
++endif
++
++CFLAGS += $(XCFLAGS)
++CFLAGS += -MD
++CFLAGS += -mcmodel=medany
++CFLAGS += -ffreestanding -fno-common -nostdlib -mno-relax
++CFLAGS += -I.
++CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++
++ifeq ($(LAB),net)
++CFLAGS += -DNET_TESTS_PORT=$(SERVERPORT)
++endif
++
++ifdef KCSAN
++CFLAGS += -DKCSAN
++KCSANFLAG = -fsanitize=thread
++endif
++
++# Disable PIE when possible (for Ubuntu 16.10 toolchain)
++ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
++CFLAGS += -fno-pie -no-pie
++endif
++ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
++CFLAGS += -fno-pie -nopie
++endif
++
++LDFLAGS = -z max-page-size=4096
++
++$K/kernel: $(OBJS) $(OBJS_KCSAN) $K/kernel.ld $U/initcode
++	$(LD) $(LDFLAGS) -T $K/kernel.ld -o $K/kernel $(OBJS) $(OBJS_KCSAN)
++	$(OBJDUMP) -S $K/kernel > $K/kernel.asm
++	$(OBJDUMP) -t $K/kernel | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $K/kernel.sym
++
++$(OBJS): EXTRAFLAG := $(KCSANFLAG)
++
++$K/%.o: $K/%.c
++	$(CC) $(CFLAGS) $(EXTRAFLAG) -c -o $@ $<
++
++
++$U/initcode: $U/initcode.S
++	$(CC) $(CFLAGS) -march=rv64g -nostdinc -I. -Ikernel -c $U/initcode.S -o $U/initcode.o
++	$(LD) $(LDFLAGS) -N -e start -Ttext 0 -o $U/initcode.out $U/initcode.o
++	$(OBJCOPY) -S -O binary $U/initcode.out $U/initcode
++	$(OBJDUMP) -S $U/initcode.o > $U/initcode.asm
++
++tags: $(OBJS) _init
++	etags *.S *.c
++
++ULIB = $U/ulib.o $U/usys.o $U/printf.o $U/umalloc.o
++
++ifeq ($(LAB),$(filter $(LAB), lock))
++ULIB += $U/statistics.o
++endif
++
++_%: %.o $(ULIB)
++	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $@ $^
++	$(OBJDUMP) -S $@ > $*.asm
++	$(OBJDUMP) -t $@ | sed '1,/SYMBOL TABLE/d; s/ .* / /; /^$$/d' > $*.sym
++
++$U/usys.S : $U/usys.pl
++	perl $U/usys.pl > $U/usys.S
++
++$U/usys.o : $U/usys.S
++	$(CC) $(CFLAGS) -c -o $U/usys.o $U/usys.S
++
++$U/_forktest: $U/forktest.o $(ULIB)
++	# forktest has less library code linked in - needs to be small
++	# in order to be able to max out the proc table.
++	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $U/_forktest $U/forktest.o $U/ulib.o $U/usys.o
++	$(OBJDUMP) -S $U/_forktest > $U/forktest.asm
++
++mkfs/mkfs: mkfs/mkfs.c $K/fs.h $K/param.h
++	gcc $(XCFLAGS) -Werror -Wall -I. -o mkfs/mkfs mkfs/mkfs.c
++
++# Prevent deletion of intermediate files, e.g. cat.o, after first build, so
++# that disk image changes after first build are persistent until clean.  More
++# details:
++# http://www.gnu.org/software/make/manual/html_node/Chained-Rules.html
++.PRECIOUS: %.o
++
++UPROGS=\
++	$U/_cat\
++	$U/_echo\
++	$U/_forktest\
++	$U/_grep\
++	$U/_init\
++	$U/_kill\
++	$U/_ln\
++	$U/_ls\
++	$U/_mkdir\
++	$U/_rm\
++	$U/_sh\
++	$U/_stressfs\
++	$U/_usertests\
++	$U/_grind\
++	$U/_wc\
++	$U/_zombie\
++
++
++
++
++ifeq ($(LAB),$(filter $(LAB), lock))
++UPROGS += \
++	$U/_stats
++endif
++
++ifeq ($(LAB),traps)
++UPROGS += \
++	$U/_call\
++	$U/_bttest\
++	$U/_alarmtest
++endif
++
++ifeq ($(LAB),lazy)
++UPROGS += \
++	$U/_lazytests
++endif
++
++ifeq ($(LAB),cow)
++UPROGS += \
++	$U/_cowtest
++endif
++
++ifeq ($(LAB),thread)
++UPROGS += \
++	$U/_uthread
++
++$U/uthread_switch.o : $U/uthread_switch.S
++	$(CC) $(CFLAGS) -c -o $U/uthread_switch.o $U/uthread_switch.S
++
++$U/_uthread: $U/uthread.o $U/uthread_switch.o $(ULIB)
++	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $U/_uthread $U/uthread.o $U/uthread_switch.o $(ULIB)
++	$(OBJDUMP) -S $U/_uthread > $U/uthread.asm
++
++ph: notxv6/ph.c
++	gcc -o ph -g -O2 $(XCFLAGS) notxv6/ph.c -pthread
++
++barrier: notxv6/barrier.c
++	gcc -o barrier -g -O2 $(XCFLAGS) notxv6/barrier.c -pthread
++endif
++
++ifeq ($(LAB),pgtbl)
++UPROGS += \
++	$U/_pgtbltest
++endif
++
++ifeq ($(LAB),lock)
++UPROGS += \
++	$U/_kalloctest\
++	$U/_bcachetest
++endif
++
++ifeq ($(LAB),fs)
++UPROGS += \
++	$U/_bigfile
++endif
++
++
++
++ifeq ($(LAB),net)
++UPROGS += \
++	$U/_nettests
++endif
++
++UEXTRA=
++ifeq ($(LAB),util)
++	UEXTRA += user/xargstest.sh
++endif
++
++
++fs.img: mkfs/mkfs README $(UEXTRA) $(UPROGS)
++	mkfs/mkfs fs.img README $(UEXTRA) $(UPROGS)
++
++-include kernel/*.d user/*.d
++
++clean: 
++	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
++	*/*.o */*.d */*.asm */*.sym \
++	$U/initcode $U/initcode.out $K/kernel fs.img \
++	mkfs/mkfs .gdbinit \
++        $U/usys.S \
++	$(UPROGS) \
++	ph barrier
++
++# try to generate a unique GDB port
++GDBPORT = $(shell expr `id -u` % 5000 + 25000)
++# QEMU's gdb stub command line changed in 0.11
++QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
++	then echo "-gdb tcp::$(GDBPORT)"; \
++	else echo "-s -p $(GDBPORT)"; fi)
++ifndef CPUS
++CPUS := 3
++endif
++ifeq ($(LAB),fs)
++CPUS := 1
++endif
++
++FWDPORT = $(shell expr `id -u` % 5000 + 25999)
++
++QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
++QEMUOPTS += -drive file=fs.img,if=none,format=raw,id=x0
++QEMUOPTS += -device virtio-blk-device,drive=x0,bus=virtio-mmio-bus.0
++
++ifeq ($(LAB),net)
++QEMUOPTS += -netdev user,id=net0,hostfwd=udp::$(FWDPORT)-:2000 -object filter-dump,id=net0,netdev=net0,file=packets.pcap
++QEMUOPTS += -device e1000,netdev=net0,bus=pcie.0
++endif
++
++qemu: $K/kernel fs.img
++	$(QEMU) $(QEMUOPTS)
++
++.gdbinit: .gdbinit.tmpl-riscv
++	sed "s/:1234/:$(GDBPORT)/" < $^ > $@
++
++qemu-gdb: $K/kernel .gdbinit fs.img
++	@echo "*** Now run 'gdb' in another window." 1>&2
++	$(QEMU) $(QEMUOPTS) -S $(QEMUGDB)
++
++ifeq ($(LAB),net)
++# try to generate a unique port for the echo server
++SERVERPORT = $(shell expr `id -u` % 5000 + 25099)
++
++server:
++	python3 server.py $(SERVERPORT)
++
++ping:
++	python3 ping.py $(FWDPORT)
++endif
++
++##
++##  FOR testing lab grading script
++##
++
++ifneq ($(V),@)
++GRADEFLAGS += -v
++endif
++
++print-gdbport:
++	@echo $(GDBPORT)
++
++grade:
++	@echo $(MAKE) clean
++	@$(MAKE) clean || \
++          (echo "'make clean' failed.  HINT: Do you have another running instance of xv6?" && exit 1)
++	./grade-lab-$(LAB) $(GRADEFLAGS)
++
++##
++## FOR web handin
++##
++
++
++WEBSUB := https://6828.scripts.mit.edu/2021/handin.py
++
++handin: tarball-pref myapi.key
++	@SUF=$(LAB); \
++	curl -f -F file=@lab-$$SUF-handin.tar.gz -F key=\<myapi.key $(WEBSUB)/upload \
++	    > /dev/null || { \
++		echo ; \
++		echo Submit seems to have failed.; \
++		echo Please go to $(WEBSUB)/ and upload the tarball manually.; }
++
++handin-check:
++	@if ! test -d .git; then \
++		echo No .git directory, is this a git repository?; \
++		false; \
++	fi
++	@if test "$$(git symbolic-ref HEAD)" != refs/heads/$(LAB); then \
++		git branch; \
++		read -p "You are not on the $(LAB) branch.  Hand-in the current branch? [y/N] " r; \
++		test "$$r" = y; \
++	fi
++	@if ! git diff-files --quiet || ! git diff-index --quiet --cached HEAD; then \
++		git status -s; \
++		echo; \
++		echo "You have uncomitted changes.  Please commit or stash them."; \
++		false; \
++	fi
++	@if test -n "`git status -s`"; then \
++		git status -s; \
++		read -p "Untracked files will not be handed in.  Continue? [y/N] " r; \
++		test "$$r" = y; \
++	fi
++
++UPSTREAM := $(shell git remote -v | grep -m 1 "xv6-labs-2021" | awk '{split($$0,a," "); print a[1]}')
++
++tarball: handin-check
++	git archive --format=tar HEAD | gzip > lab-$(LAB)-handin.tar.gz
++
++tarball-pref: handin-check
++	@SUF=$(LAB); \
++	git archive --format=tar HEAD > lab-$$SUF-handin.tar; \
++	git diff $(UPSTREAM)/$(LAB) > /tmp/lab-$$SUF-diff.patch; \
++	tar -rf lab-$$SUF-handin.tar /tmp/lab-$$SUF-diff.patch; \
++	gzip -c lab-$$SUF-handin.tar > lab-$$SUF-handin.tar.gz; \
++	rm lab-$$SUF-handin.tar; \
++	rm /tmp/lab-$$SUF-diff.patch; \
++
++myapi.key:
++	@echo Get an API key for yourself by visiting $(WEBSUB)/
++	@read -p "Please enter your API key: " k; \
++	if test `echo "$$k" |tr -d '\n' |wc -c` = 32 ; then \
++		TF=`mktemp -t tmp.XXXXXX`; \
++		if test "x$$TF" != "x" ; then \
++			echo "$$k" |tr -d '\n' > $$TF; \
++			mv -f $$TF $@; \
++		else \
++			echo mktemp failed; \
++			false; \
++		fi; \
++	else \
++		echo Bad API key: $$k; \
++		echo An API key should be 32 characters long.; \
++		false; \
++	fi;
++
++
++.PHONY: handin tarball tarball-pref clean grade handin-check
+diff --git a/answers-traps.txt b/answers-traps.txt
+new file mode 100644
+index 0000000..7a94671
+--- /dev/null
++++ b/answers-traps.txt
+@@ -0,0 +1,23 @@
++1. Which registers contain arguments to functions? For example, which register holds 13 in main's call to printf?
++Arguments to functions are passed in registers a0 through a7. In main's call to printf, 13 is loaded into register a2.
++
++2. Where is the call to function f in the assembly code for main? Where is the call to g? (Hint: the compiler may inline functions.)
++There are no physical function calls to f or g in main's assembly code. The compiler optimized and inlined both f and g directly into main, calculating the result (f(8)+1 = 12) at compile time and loading it directly into register a1.
++
++3. At what address is the function printf located?
++The function printf is located at address 0x0000000000000616.
++
++4. What value is in the register ra just after the jalr to printf in main?
++The register ra will contain 0x38, which is the address of the instruction immediately following the jalr (0x34 + 4).
++
++5. Run the following code.
++   unsigned int i = 0x00646c72;
++   printf("H%x Wo%s", 57616, &i);
++What is the output?
++The output is "He110 World". 57616 is 0xe110 in hex, and i is stored in memory (little-endian) as the ASCII bytes 'r' (0x72), 'l' (0x6c), 'd' (0x64), '\0' (0x00).
++
++6. The output depends on that fact that the RISC-V is little-endian. If the RISC-V were instead big-endian what would you set i to in order to yield the same output? Would you need to change 57616 to a different value?
++On a big-endian machine, i should be set to 0x726c6400 to lay out 'r', 'l', 'd', '\0' in that order in memory. You would not need to change 57616 to a different value because it is passed by value (held in register a1 directly), not by pointer reference, so memory endianness does not affect it.
++
++7. In the following code, what is going to be printed after 'y='? (note: the answer is not a specific value.) Why does this happen?
++It will print whatever garbage value happens to be in register a2 at the time of the printf call. This is because printf expects the value for the second format specifier (%d) to be in register a2, but no corresponding argument was passed to printf to populate a2.
+diff --git a/conf/lab.mk b/conf/lab.mk
+index 2b9988d..181d4a3 100644
+--- a/conf/lab.mk
++++ b/conf/lab.mk
+@@ -1 +1 @@
+-LAB=traps
++LAB=traps
+diff --git a/grade-lab-traps b/grade-lab-traps
+index 058e77b..50dd467 100755
+--- a/grade-lab-traps
++++ b/grade-lab-traps
+@@ -1,70 +1,70 @@
+-#!/usr/bin/env python3
+-
+-import os
+-import re
+-import subprocess
+-from gradelib import *
+-
+-r = Runner(save("xv6.out"))
+-
+-@test(5, "answers-traps.txt")
+-def test_answers():
+-    # just a simple sanity check, will be graded manually
+-    check_answers("answers-traps.txt")
+-
+-BACKTRACE_RE = r"^(0x000000008[0-9a-f]+)"
+-
+-def addr2line():
+-    for f in ['riscv64-unknown-elf-addr2line', 'riscv64-linux-gnu-addr2line', 'addr2line', ]:
+-        try:
+-            devnull = open(os.devnull)
+-            subprocess.Popen([f], stdout=devnull, stderr=devnull).communicate()
+-            return f
+-        except OSError:
+-            continue
+-    raise AssertionError('Cannot find the addr2line program')
+-
+-@test(10, "backtrace test")
+-def test_backtracetest():
+-    r.run_qemu(shell_script([
+-        'bttest'
+-    ]))
+-    a2l = addr2line()
+-    matches = re.findall(BACKTRACE_RE, r.qemu.output, re.MULTILINE)
+-    assert_equal(len(matches), 3)
+-    files = ['sysproc.c', 'syscall.c', 'trap.c']
+-    for f, m in zip(files, matches):
+-        result = subprocess.run([a2l, '-e', 'kernel/kernel', m], stdout=subprocess.PIPE)
+-        if not f in result.stdout.decode("utf-8"):
+-            raise AssertionError('Trace is incorrect; no %s' % f)
+-
+-@test(0, "running alarmtest")
+-def test_alarmtest():
+-    r.run_qemu(shell_script([
+-        'alarmtest'
+-    ]))
+-
+-@test(20, "alarmtest: test0", parent=test_alarmtest)
+-def test_alarmtest_test0():
+-    r.match('^test0 passed$')
+-
+-@test(20, "alarmtest: test1", parent=test_alarmtest)
+-def test_alarmtest_test1():
+-    r.match('^\\.?test1 passed$')
+-
+-@test(10, "alarmtest: test2", parent=test_alarmtest)
+-def test_alarmtest_test2():
+-    r.match('^\\.?test2 passed$')
+-
+-@test(19, "usertests")
+-def test_usertests():
+-    r.run_qemu(shell_script([
+-        'usertests'
+-    ]), timeout=300)
+-    r.match('^ALL TESTS PASSED$')
+-
+-@test(1, "time")
+-def test_time():
+-    check_time()
+-
+-run_tests()
++#!/usr/bin/env python3
++
++import os
++import re
++import subprocess
++from gradelib import *
++
++r = Runner(save("xv6.out"))
++
++@test(5, "answers-traps.txt")
++def test_answers():
++    # just a simple sanity check, will be graded manually
++    check_answers("answers-traps.txt")
++
++BACKTRACE_RE = r"^(0x000000008[0-9a-f]+)"
++
++def addr2line():
++    for f in ['riscv64-unknown-elf-addr2line', 'riscv64-linux-gnu-addr2line', 'addr2line', ]:
++        try:
++            devnull = open(os.devnull)
++            subprocess.Popen([f], stdout=devnull, stderr=devnull).communicate()
++            return f
++        except OSError:
++            continue
++    raise AssertionError('Cannot find the addr2line program')
++
++@test(10, "backtrace test")
++def test_backtracetest():
++    r.run_qemu(shell_script([
++        'bttest'
++    ]))
++    a2l = addr2line()
++    matches = re.findall(BACKTRACE_RE, r.qemu.output, re.MULTILINE)
++    assert_equal(len(matches), 3)
++    files = ['sysproc.c', 'syscall.c', 'trap.c']
++    for f, m in zip(files, matches):
++        result = subprocess.run([a2l, '-e', 'kernel/kernel', m], stdout=subprocess.PIPE)
++        if not f in result.stdout.decode("utf-8"):
++            raise AssertionError('Trace is incorrect; no %s' % f)
++
++@test(0, "running alarmtest")
++def test_alarmtest():
++    r.run_qemu(shell_script([
++        'alarmtest'
++    ]))
++
++@test(20, "alarmtest: test0", parent=test_alarmtest)
++def test_alarmtest_test0():
++    r.match('^test0 passed$')
++
++@test(20, "alarmtest: test1", parent=test_alarmtest)
++def test_alarmtest_test1():
++    r.match('^\\.?test1 passed$')
++
++@test(10, "alarmtest: test2", parent=test_alarmtest)
++def test_alarmtest_test2():
++    r.match('^\\.?test2 passed$')
++
++@test(19, "usertests")
++def test_usertests():
++    r.run_qemu(shell_script([
++        'usertests'
++    ]), timeout=300)
++    r.match('^ALL TESTS PASSED$')
++
++@test(1, "time")
++def test_time():
++    check_time()
++
++run_tests()
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..5dcf871 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -1,186 +1,187 @@
+-struct buf;
+-struct context;
+-struct file;
+-struct inode;
+-struct pipe;
+-struct proc;
+-struct spinlock;
+-struct sleeplock;
+-struct stat;
+-struct superblock;
+-
+-// bio.c
+-void            binit(void);
+-struct buf*     bread(uint, uint);
+-void            brelse(struct buf*);
+-void            bwrite(struct buf*);
+-void            bpin(struct buf*);
+-void            bunpin(struct buf*);
+-
+-// console.c
+-void            consoleinit(void);
+-void            consoleintr(int);
+-void            consputc(int);
+-
+-// exec.c
+-int             exec(char*, char**);
+-
+-// file.c
+-struct file*    filealloc(void);
+-void            fileclose(struct file*);
+-struct file*    filedup(struct file*);
+-void            fileinit(void);
+-int             fileread(struct file*, uint64, int n);
+-int             filestat(struct file*, uint64 addr);
+-int             filewrite(struct file*, uint64, int n);
+-
+-// fs.c
+-void            fsinit(int);
+-int             dirlink(struct inode*, char*, uint);
+-struct inode*   dirlookup(struct inode*, char*, uint*);
+-struct inode*   ialloc(uint, short);
+-struct inode*   idup(struct inode*);
+-void            iinit();
+-void            ilock(struct inode*);
+-void            iput(struct inode*);
+-void            iunlock(struct inode*);
+-void            iunlockput(struct inode*);
+-void            iupdate(struct inode*);
+-int             namecmp(const char*, const char*);
+-struct inode*   namei(char*);
+-struct inode*   nameiparent(char*, char*);
+-int             readi(struct inode*, int, uint64, uint, uint);
+-void            stati(struct inode*, struct stat*);
+-int             writei(struct inode*, int, uint64, uint, uint);
+-void            itrunc(struct inode*);
+-
+-// ramdisk.c
+-void            ramdiskinit(void);
+-void            ramdiskintr(void);
+-void            ramdiskrw(struct buf*);
+-
+-// kalloc.c
+-void*           kalloc(void);
+-void            kfree(void *);
+-void            kinit(void);
+-
+-// log.c
+-void            initlog(int, struct superblock*);
+-void            log_write(struct buf*);
+-void            begin_op(void);
+-void            end_op(void);
+-
+-// pipe.c
+-int             pipealloc(struct file**, struct file**);
+-void            pipeclose(struct pipe*, int);
+-int             piperead(struct pipe*, uint64, int);
+-int             pipewrite(struct pipe*, uint64, int);
+-
+-// printf.c
+-void            printf(char*, ...);
+-void            panic(char*) __attribute__((noreturn));
+-void            printfinit(void);
+-
+-// proc.c
+-int             cpuid(void);
+-void            exit(int);
+-int             fork(void);
+-int             growproc(int);
+-void            proc_mapstacks(pagetable_t);
+-pagetable_t     proc_pagetable(struct proc *);
+-void            proc_freepagetable(pagetable_t, uint64);
+-int             kill(int);
+-struct cpu*     mycpu(void);
+-struct cpu*     getmycpu(void);
+-struct proc*    myproc();
+-void            procinit(void);
+-void            scheduler(void) __attribute__((noreturn));
+-void            sched(void);
+-void            sleep(void*, struct spinlock*);
+-void            userinit(void);
+-int             wait(uint64);
+-void            wakeup(void*);
+-void            yield(void);
+-int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+-int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+-void            procdump(void);
+-
+-// swtch.S
+-void            swtch(struct context*, struct context*);
+-
+-// spinlock.c
+-void            acquire(struct spinlock*);
+-int             holding(struct spinlock*);
+-void            initlock(struct spinlock*, char*);
+-void            release(struct spinlock*);
+-void            push_off(void);
+-void            pop_off(void);
+-
+-// sleeplock.c
+-void            acquiresleep(struct sleeplock*);
+-void            releasesleep(struct sleeplock*);
+-int             holdingsleep(struct sleeplock*);
+-void            initsleeplock(struct sleeplock*, char*);
+-
+-// string.c
+-int             memcmp(const void*, const void*, uint);
+-void*           memmove(void*, const void*, uint);
+-void*           memset(void*, int, uint);
+-char*           safestrcpy(char*, const char*, int);
+-int             strlen(const char*);
+-int             strncmp(const char*, const char*, uint);
+-char*           strncpy(char*, const char*, int);
+-
+-// syscall.c
+-int             argint(int, int*);
+-int             argstr(int, char*, int);
+-int             argaddr(int, uint64 *);
+-int             fetchstr(uint64, char*, int);
+-int             fetchaddr(uint64, uint64*);
+-void            syscall();
+-
+-// trap.c
+-extern uint     ticks;
+-void            trapinit(void);
+-void            trapinithart(void);
+-extern struct spinlock tickslock;
+-void            usertrapret(void);
+-
+-// uart.c
+-void            uartinit(void);
+-void            uartintr(void);
+-void            uartputc(int);
+-void            uartputc_sync(int);
+-int             uartgetc(void);
+-
+-// vm.c
+-void            kvminit(void);
+-void            kvminithart(void);
+-void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
+-int             mappages(pagetable_t, uint64, uint64, uint64, int);
+-pagetable_t     uvmcreate(void);
+-void            uvminit(pagetable_t, uchar *, uint);
+-uint64          uvmalloc(pagetable_t, uint64, uint64);
+-uint64          uvmdealloc(pagetable_t, uint64, uint64);
+-int             uvmcopy(pagetable_t, pagetable_t, uint64);
+-void            uvmfree(pagetable_t, uint64);
+-void            uvmunmap(pagetable_t, uint64, uint64, int);
+-void            uvmclear(pagetable_t, uint64);
+-uint64          walkaddr(pagetable_t, uint64);
+-int             copyout(pagetable_t, uint64, char *, uint64);
+-int             copyin(pagetable_t, char *, uint64, uint64);
+-int             copyinstr(pagetable_t, char *, uint64, uint64);
+-
+-// plic.c
+-void            plicinit(void);
+-void            plicinithart(void);
+-int             plic_claim(void);
+-void            plic_complete(int);
+-
+-// virtio_disk.c
+-void            virtio_disk_init(void);
+-void            virtio_disk_rw(struct buf *, int);
+-void            virtio_disk_intr(void);
+-
+-// number of elements in fixed-size array
+-#define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++struct buf;
++struct context;
++struct file;
++struct inode;
++struct pipe;
++struct proc;
++struct spinlock;
++struct sleeplock;
++struct stat;
++struct superblock;
++
++// bio.c
++void            binit(void);
++struct buf*     bread(uint, uint);
++void            brelse(struct buf*);
++void            bwrite(struct buf*);
++void            bpin(struct buf*);
++void            bunpin(struct buf*);
++
++// console.c
++void            consoleinit(void);
++void            consoleintr(int);
++void            consputc(int);
++
++// exec.c
++int             exec(char*, char**);
++
++// file.c
++struct file*    filealloc(void);
++void            fileclose(struct file*);
++struct file*    filedup(struct file*);
++void            fileinit(void);
++int             fileread(struct file*, uint64, int n);
++int             filestat(struct file*, uint64 addr);
++int             filewrite(struct file*, uint64, int n);
++
++// fs.c
++void            fsinit(int);
++int             dirlink(struct inode*, char*, uint);
++struct inode*   dirlookup(struct inode*, char*, uint*);
++struct inode*   ialloc(uint, short);
++struct inode*   idup(struct inode*);
++void            iinit();
++void            ilock(struct inode*);
++void            iput(struct inode*);
++void            iunlock(struct inode*);
++void            iunlockput(struct inode*);
++void            iupdate(struct inode*);
++int             namecmp(const char*, const char*);
++struct inode*   namei(char*);
++struct inode*   nameiparent(char*, char*);
++int             readi(struct inode*, int, uint64, uint, uint);
++void            stati(struct inode*, struct stat*);
++int             writei(struct inode*, int, uint64, uint, uint);
++void            itrunc(struct inode*);
++
++// ramdisk.c
++void            ramdiskinit(void);
++void            ramdiskintr(void);
++void            ramdiskrw(struct buf*);
++
++// kalloc.c
++void*           kalloc(void);
++void            kfree(void *);
++void            kinit(void);
++
++// log.c
++void            initlog(int, struct superblock*);
++void            log_write(struct buf*);
++void            begin_op(void);
++void            end_op(void);
++
++// pipe.c
++int             pipealloc(struct file**, struct file**);
++void            pipeclose(struct pipe*, int);
++int             piperead(struct pipe*, uint64, int);
++int             pipewrite(struct pipe*, uint64, int);
++
++// printf.c
++void            printf(char*, ...);
++void            panic(char*) __attribute__((noreturn));
++void            printfinit(void);
++void            backtrace(void);
++
++// proc.c
++int             cpuid(void);
++void            exit(int);
++int             fork(void);
++int             growproc(int);
++void            proc_mapstacks(pagetable_t);
++pagetable_t     proc_pagetable(struct proc *);
++void            proc_freepagetable(pagetable_t, uint64);
++int             kill(int);
++struct cpu*     mycpu(void);
++struct cpu*     getmycpu(void);
++struct proc*    myproc();
++void            procinit(void);
++void            scheduler(void) __attribute__((noreturn));
++void            sched(void);
++void            sleep(void*, struct spinlock*);
++void            userinit(void);
++int             wait(uint64);
++void            wakeup(void*);
++void            yield(void);
++int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
++int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
++void            procdump(void);
++
++// swtch.S
++void            swtch(struct context*, struct context*);
++
++// spinlock.c
++void            acquire(struct spinlock*);
++int             holding(struct spinlock*);
++void            initlock(struct spinlock*, char*);
++void            release(struct spinlock*);
++void            push_off(void);
++void            pop_off(void);
++
++// sleeplock.c
++void            acquiresleep(struct sleeplock*);
++void            releasesleep(struct sleeplock*);
++int             holdingsleep(struct sleeplock*);
++void            initsleeplock(struct sleeplock*, char*);
++
++// string.c
++int             memcmp(const void*, const void*, uint);
++void*           memmove(void*, const void*, uint);
++void*           memset(void*, int, uint);
++char*           safestrcpy(char*, const char*, int);
++int             strlen(const char*);
++int             strncmp(const char*, const char*, uint);
++char*           strncpy(char*, const char*, int);
++
++// syscall.c
++int             argint(int, int*);
++int             argstr(int, char*, int);
++int             argaddr(int, uint64 *);
++int             fetchstr(uint64, char*, int);
++int             fetchaddr(uint64, uint64*);
++void            syscall();
++
++// trap.c
++extern uint     ticks;
++void            trapinit(void);
++void            trapinithart(void);
++extern struct spinlock tickslock;
++void            usertrapret(void);
++
++// uart.c
++void            uartinit(void);
++void            uartintr(void);
++void            uartputc(int);
++void            uartputc_sync(int);
++int             uartgetc(void);
++
++// vm.c
++void            kvminit(void);
++void            kvminithart(void);
++void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
++int             mappages(pagetable_t, uint64, uint64, uint64, int);
++pagetable_t     uvmcreate(void);
++void            uvminit(pagetable_t, uchar *, uint);
++uint64          uvmalloc(pagetable_t, uint64, uint64);
++uint64          uvmdealloc(pagetable_t, uint64, uint64);
++int             uvmcopy(pagetable_t, pagetable_t, uint64);
++void            uvmfree(pagetable_t, uint64);
++void            uvmunmap(pagetable_t, uint64, uint64, int);
++void            uvmclear(pagetable_t, uint64);
++uint64          walkaddr(pagetable_t, uint64);
++int             copyout(pagetable_t, uint64, char *, uint64);
++int             copyin(pagetable_t, char *, uint64, uint64);
++int             copyinstr(pagetable_t, char *, uint64, uint64);
++
++// plic.c
++void            plicinit(void);
++void            plicinithart(void);
++int             plic_claim(void);
++void            plic_complete(int);
++
++// virtio_disk.c
++void            virtio_disk_init(void);
++void            virtio_disk_rw(struct buf *, int);
++void            virtio_disk_intr(void);
++
++// number of elements in fixed-size array
++#define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/kernel/exec.c b/kernel/exec.c
+index d62d29d..c773bb8 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -1,154 +1,154 @@
+-#include "types.h"
+-#include "param.h"
+-#include "memlayout.h"
+-#include "riscv.h"
+-#include "spinlock.h"
+-#include "proc.h"
+-#include "defs.h"
+-#include "elf.h"
+-
+-static int loadseg(pde_t *pgdir, uint64 addr, struct inode *ip, uint offset, uint sz);
+-
+-int
+-exec(char *path, char **argv)
+-{
+-  char *s, *last;
+-  int i, off;
+-  uint64 argc, sz = 0, sp, ustack[MAXARG], stackbase;
+-  struct elfhdr elf;
+-  struct inode *ip;
+-  struct proghdr ph;
+-  pagetable_t pagetable = 0, oldpagetable;
+-  struct proc *p = myproc();
+-
+-  begin_op();
+-
+-  if((ip = namei(path)) == 0){
+-    end_op();
+-    return -1;
+-  }
+-  ilock(ip);
+-
+-  // Check ELF header
+-  if(readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf))
+-    goto bad;
+-  if(elf.magic != ELF_MAGIC)
+-    goto bad;
+-
+-  if((pagetable = proc_pagetable(p)) == 0)
+-    goto bad;
+-
+-  // Load program into memory.
+-  for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
+-    if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
+-      goto bad;
+-    if(ph.type != ELF_PROG_LOAD)
+-      continue;
+-    if(ph.memsz < ph.filesz)
+-      goto bad;
+-    if(ph.vaddr + ph.memsz < ph.vaddr)
+-      goto bad;
+-    uint64 sz1;
+-    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz)) == 0)
+-      goto bad;
+-    sz = sz1;
+-    if((ph.vaddr % PGSIZE) != 0)
+-      goto bad;
+-    if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
+-      goto bad;
+-  }
+-  iunlockput(ip);
+-  end_op();
+-  ip = 0;
+-
+-  p = myproc();
+-  uint64 oldsz = p->sz;
+-
+-  // Allocate two pages at the next page boundary.
+-  // Use the second as the user stack.
+-  sz = PGROUNDUP(sz);
+-  uint64 sz1;
+-  if((sz1 = uvmalloc(pagetable, sz, sz + 2*PGSIZE)) == 0)
+-    goto bad;
+-  sz = sz1;
+-  uvmclear(pagetable, sz-2*PGSIZE);
+-  sp = sz;
+-  stackbase = sp - PGSIZE;
+-
+-  // Push argument strings, prepare rest of stack in ustack.
+-  for(argc = 0; argv[argc]; argc++) {
+-    if(argc >= MAXARG)
+-      goto bad;
+-    sp -= strlen(argv[argc]) + 1;
+-    sp -= sp % 16; // riscv sp must be 16-byte aligned
+-    if(sp < stackbase)
+-      goto bad;
+-    if(copyout(pagetable, sp, argv[argc], strlen(argv[argc]) + 1) < 0)
+-      goto bad;
+-    ustack[argc] = sp;
+-  }
+-  ustack[argc] = 0;
+-
+-  // push the array of argv[] pointers.
+-  sp -= (argc+1) * sizeof(uint64);
+-  sp -= sp % 16;
+-  if(sp < stackbase)
+-    goto bad;
+-  if(copyout(pagetable, sp, (char *)ustack, (argc+1)*sizeof(uint64)) < 0)
+-    goto bad;
+-
+-  // arguments to user main(argc, argv)
+-  // argc is returned via the system call return
+-  // value, which goes in a0.
+-  p->trapframe->a1 = sp;
+-
+-  // Save program name for debugging.
+-  for(last=s=path; *s; s++)
+-    if(*s == '/')
+-      last = s+1;
+-  safestrcpy(p->name, last, sizeof(p->name));
+-    
+-  // Commit to the user image.
+-  oldpagetable = p->pagetable;
+-  p->pagetable = pagetable;
+-  p->sz = sz;
+-  p->trapframe->epc = elf.entry;  // initial program counter = main
+-  p->trapframe->sp = sp; // initial stack pointer
+-  proc_freepagetable(oldpagetable, oldsz);
+-
+-  return argc; // this ends up in a0, the first argument to main(argc, argv)
+-
+- bad:
+-  if(pagetable)
+-    proc_freepagetable(pagetable, sz);
+-  if(ip){
+-    iunlockput(ip);
+-    end_op();
+-  }
+-  return -1;
+-}
+-
+-// Load a program segment into pagetable at virtual address va.
+-// va must be page-aligned
+-// and the pages from va to va+sz must already be mapped.
+-// Returns 0 on success, -1 on failure.
+-static int
+-loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz)
+-{
+-  uint i, n;
+-  uint64 pa;
+-
+-  for(i = 0; i < sz; i += PGSIZE){
+-    pa = walkaddr(pagetable, va + i);
+-    if(pa == 0)
+-      panic("loadseg: address should exist");
+-    if(sz - i < PGSIZE)
+-      n = sz - i;
+-    else
+-      n = PGSIZE;
+-    if(readi(ip, 0, (uint64)pa, offset+i, n) != n)
+-      return -1;
+-  }
+-  
+-  return 0;
+-}
++#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "defs.h"
++#include "elf.h"
++
++static int loadseg(pde_t *pgdir, uint64 addr, struct inode *ip, uint offset, uint sz);
++
++int
++exec(char *path, char **argv)
++{
++  char *s, *last;
++  int i, off;
++  uint64 argc, sz = 0, sp, ustack[MAXARG], stackbase;
++  struct elfhdr elf;
++  struct inode *ip;
++  struct proghdr ph;
++  pagetable_t pagetable = 0, oldpagetable;
++  struct proc *p = myproc();
++
++  begin_op();
++
++  if((ip = namei(path)) == 0){
++    end_op();
++    return -1;
++  }
++  ilock(ip);
++
++  // Check ELF header
++  if(readi(ip, 0, (uint64)&elf, 0, sizeof(elf)) != sizeof(elf))
++    goto bad;
++  if(elf.magic != ELF_MAGIC)
++    goto bad;
++
++  if((pagetable = proc_pagetable(p)) == 0)
++    goto bad;
++
++  // Load program into memory.
++  for(i=0, off=elf.phoff; i<elf.phnum; i++, off+=sizeof(ph)){
++    if(readi(ip, 0, (uint64)&ph, off, sizeof(ph)) != sizeof(ph))
++      goto bad;
++    if(ph.type != ELF_PROG_LOAD)
++      continue;
++    if(ph.memsz < ph.filesz)
++      goto bad;
++    if(ph.vaddr + ph.memsz < ph.vaddr)
++      goto bad;
++    uint64 sz1;
++    if((sz1 = uvmalloc(pagetable, sz, ph.vaddr + ph.memsz)) == 0)
++      goto bad;
++    sz = sz1;
++    if((ph.vaddr % PGSIZE) != 0)
++      goto bad;
++    if(loadseg(pagetable, ph.vaddr, ip, ph.off, ph.filesz) < 0)
++      goto bad;
++  }
++  iunlockput(ip);
++  end_op();
++  ip = 0;
++
++  p = myproc();
++  uint64 oldsz = p->sz;
++
++  // Allocate two pages at the next page boundary.
++  // Use the second as the user stack.
++  sz = PGROUNDUP(sz);
++  uint64 sz1;
++  if((sz1 = uvmalloc(pagetable, sz, sz + 2*PGSIZE)) == 0)
++    goto bad;
++  sz = sz1;
++  uvmclear(pagetable, sz-2*PGSIZE);
++  sp = sz;
++  stackbase = sp - PGSIZE;
++
++  // Push argument strings, prepare rest of stack in ustack.
++  for(argc = 0; argv[argc]; argc++) {
++    if(argc >= MAXARG)
++      goto bad;
++    sp -= strlen(argv[argc]) + 1;
++    sp -= sp % 16; // riscv sp must be 16-byte aligned
++    if(sp < stackbase)
++      goto bad;
++    if(copyout(pagetable, sp, argv[argc], strlen(argv[argc]) + 1) < 0)
++      goto bad;
++    ustack[argc] = sp;
++  }
++  ustack[argc] = 0;
++
++  // push the array of argv[] pointers.
++  sp -= (argc+1) * sizeof(uint64);
++  sp -= sp % 16;
++  if(sp < stackbase)
++    goto bad;
++  if(copyout(pagetable, sp, (char *)ustack, (argc+1)*sizeof(uint64)) < 0)
++    goto bad;
++
++  // arguments to user main(argc, argv)
++  // argc is returned via the system call return
++  // value, which goes in a0.
++  p->trapframe->a1 = sp;
++
++  // Save program name for debugging.
++  for(last=s=path; *s; s++)
++    if(*s == '/')
++      last = s+1;
++  safestrcpy(p->name, last, sizeof(p->name));
++    
++  // Commit to the user image.
++  oldpagetable = p->pagetable;
++  p->pagetable = pagetable;
++  p->sz = sz;
++  p->trapframe->epc = elf.entry;  // initial program counter = main
++  p->trapframe->sp = sp; // initial stack pointer
++  proc_freepagetable(oldpagetable, oldsz);
++
++  return argc; // this ends up in a0, the first argument to main(argc, argv)
++
++ bad:
++  if(pagetable)
++    proc_freepagetable(pagetable, sz);
++  if(ip){
++    iunlockput(ip);
++    end_op();
++  }
++  return -1;
++}
++
++// Load a program segment into pagetable at virtual address va.
++// va must be page-aligned
++// and the pages from va to va+sz must already be mapped.
++// Returns 0 on success, -1 on failure.
++static int
++loadseg(pagetable_t pagetable, uint64 va, struct inode *ip, uint offset, uint sz)
++{
++  uint i, n;
++  uint64 pa;
++
++  for(i = 0; i < sz; i += PGSIZE){
++    pa = walkaddr(pagetable, va + i);
++    if(pa == 0)
++      panic("loadseg: address should exist");
++    if(sz - i < PGSIZE)
++      n = sz - i;
++    else
++      n = PGSIZE;
++    if(readi(ip, 0, (uint64)pa, offset+i, n) != n)
++      return -1;
++  }
++  
++  return 0;
++}
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index fa6a0ac..81c90a5 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -1,82 +1,82 @@
+-// Physical memory allocator, for user processes,
+-// kernel stacks, page-table pages,
+-// and pipe buffers. Allocates whole 4096-byte pages.
+-
+-#include "types.h"
+-#include "param.h"
+-#include "memlayout.h"
+-#include "spinlock.h"
+-#include "riscv.h"
+-#include "defs.h"
+-
+-void freerange(void *pa_start, void *pa_end);
+-
+-extern char end[]; // first address after kernel.
+-                   // defined by kernel.ld.
+-
+-struct run {
+-  struct run *next;
+-};
+-
+-struct {
+-  struct spinlock lock;
+-  struct run *freelist;
+-} kmem;
+-
+-void
+-kinit()
+-{
+-  initlock(&kmem.lock, "kmem");
+-  freerange(end, (void*)PHYSTOP);
+-}
+-
+-void
+-freerange(void *pa_start, void *pa_end)
+-{
+-  char *p;
+-  p = (char*)PGROUNDUP((uint64)pa_start);
+-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+-    kfree(p);
+-}
+-
+-// Free the page of physical memory pointed at by v,
+-// which normally should have been returned by a
+-// call to kalloc().  (The exception is when
+-// initializing the allocator; see kinit above.)
+-void
+-kfree(void *pa)
+-{
+-  struct run *r;
+-
+-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+-    panic("kfree");
+-
+-  // Fill with junk to catch dangling refs.
+-  memset(pa, 1, PGSIZE);
+-
+-  r = (struct run*)pa;
+-
+-  acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
+-  release(&kmem.lock);
+-}
+-
+-// Allocate one 4096-byte page of physical memory.
+-// Returns a pointer that the kernel can use.
+-// Returns 0 if the memory cannot be allocated.
+-void *
+-kalloc(void)
+-{
+-  struct run *r;
+-
+-  acquire(&kmem.lock);
+-  r = kmem.freelist;
+-  if(r)
+-    kmem.freelist = r->next;
+-  release(&kmem.lock);
+-
+-  if(r)
+-    memset((char*)r, 5, PGSIZE); // fill with junk
+-  return (void*)r;
+-}
++// Physical memory allocator, for user processes,
++// kernel stacks, page-table pages,
++// and pipe buffers. Allocates whole 4096-byte pages.
++
++#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "spinlock.h"
++#include "riscv.h"
++#include "defs.h"
++
++void freerange(void *pa_start, void *pa_end);
++
++extern char end[]; // first address after kernel.
++                   // defined by kernel.ld.
++
++struct run {
++  struct run *next;
++};
++
++struct {
++  struct spinlock lock;
++  struct run *freelist;
++} kmem;
++
++void
++kinit()
++{
++  initlock(&kmem.lock, "kmem");
++  freerange(end, (void*)PHYSTOP);
++}
++
++void
++freerange(void *pa_start, void *pa_end)
++{
++  char *p;
++  p = (char*)PGROUNDUP((uint64)pa_start);
++  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
++    kfree(p);
++}
++
++// Free the page of physical memory pointed at by v,
++// which normally should have been returned by a
++// call to kalloc().  (The exception is when
++// initializing the allocator; see kinit above.)
++void
++kfree(void *pa)
++{
++  struct run *r;
++
++  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
++    panic("kfree");
++
++  // Fill with junk to catch dangling refs.
++  memset(pa, 1, PGSIZE);
++
++  r = (struct run*)pa;
++
++  acquire(&kmem.lock);
++  r->next = kmem.freelist;
++  kmem.freelist = r;
++  release(&kmem.lock);
++}
++
++// Allocate one 4096-byte page of physical memory.
++// Returns a pointer that the kernel can use.
++// Returns 0 if the memory cannot be allocated.
++void *
++kalloc(void)
++{
++  struct run *r;
++
++  acquire(&kmem.lock);
++  r = kmem.freelist;
++  if(r)
++    kmem.freelist = r->next;
++  release(&kmem.lock);
++
++  if(r)
++    memset((char*)r, 5, PGSIZE); // fill with junk
++  return (void*)r;
++}
+diff --git a/kernel/memlayout.h b/kernel/memlayout.h
+index 776f98c..6b032fb 100644
+--- a/kernel/memlayout.h
++++ b/kernel/memlayout.h
+@@ -1,67 +1,67 @@
+-// Physical memory layout
+-
+-// qemu -machine virt is set up like this,
+-// based on qemu's hw/riscv/virt.c:
+-//
+-// 00001000 -- boot ROM, provided by qemu
+-// 02000000 -- CLINT
+-// 0C000000 -- PLIC
+-// 10000000 -- uart0 
+-// 10001000 -- virtio disk 
+-// 80000000 -- boot ROM jumps here in machine mode
+-//             -kernel loads the kernel here
+-// unused RAM after 80000000.
+-
+-// the kernel uses physical memory thus:
+-// 80000000 -- entry.S, then kernel text and data
+-// end -- start of kernel page allocation area
+-// PHYSTOP -- end RAM used by the kernel
+-
+-// qemu puts UART registers here in physical memory.
+-#define UART0 0x10000000L
+-#define UART0_IRQ 10
+-
+-// virtio mmio interface
+-#define VIRTIO0 0x10001000
+-#define VIRTIO0_IRQ 1
+-
+-// core local interruptor (CLINT), which contains the timer.
+-#define CLINT 0x2000000L
+-#define CLINT_MTIMECMP(hartid) (CLINT + 0x4000 + 8*(hartid))
+-#define CLINT_MTIME (CLINT + 0xBFF8) // cycles since boot.
+-
+-// qemu puts platform-level interrupt controller (PLIC) here.
+-#define PLIC 0x0c000000L
+-#define PLIC_PRIORITY (PLIC + 0x0)
+-#define PLIC_PENDING (PLIC + 0x1000)
+-#define PLIC_MENABLE(hart) (PLIC + 0x2000 + (hart)*0x100)
+-#define PLIC_SENABLE(hart) (PLIC + 0x2080 + (hart)*0x100)
+-#define PLIC_MPRIORITY(hart) (PLIC + 0x200000 + (hart)*0x2000)
+-#define PLIC_SPRIORITY(hart) (PLIC + 0x201000 + (hart)*0x2000)
+-#define PLIC_MCLAIM(hart) (PLIC + 0x200004 + (hart)*0x2000)
+-#define PLIC_SCLAIM(hart) (PLIC + 0x201004 + (hart)*0x2000)
+-
+-// the kernel expects there to be RAM
+-// for use by the kernel and user pages
+-// from physical address 0x80000000 to PHYSTOP.
+-#define KERNBASE 0x80000000L
+-#define PHYSTOP (KERNBASE + 128*1024*1024)
+-
+-// map the trampoline page to the highest address,
+-// in both user and kernel space.
+-#define TRAMPOLINE (MAXVA - PGSIZE)
+-
+-// map kernel stacks beneath the trampoline,
+-// each surrounded by invalid guard pages.
+-#define KSTACK(p) (TRAMPOLINE - ((p)+1)* 2*PGSIZE)
+-
+-// User memory layout.
+-// Address zero first:
+-//   text
+-//   original data and bss
+-//   fixed-size stack
+-//   expandable heap
+-//   ...
+-//   TRAPFRAME (p->trapframe, used by the trampoline)
+-//   TRAMPOLINE (the same page as in the kernel)
+-#define TRAPFRAME (TRAMPOLINE - PGSIZE)
++// Physical memory layout
++
++// qemu -machine virt is set up like this,
++// based on qemu's hw/riscv/virt.c:
++//
++// 00001000 -- boot ROM, provided by qemu
++// 02000000 -- CLINT
++// 0C000000 -- PLIC
++// 10000000 -- uart0 
++// 10001000 -- virtio disk 
++// 80000000 -- boot ROM jumps here in machine mode
++//             -kernel loads the kernel here
++// unused RAM after 80000000.
++
++// the kernel uses physical memory thus:
++// 80000000 -- entry.S, then kernel text and data
++// end -- start of kernel page allocation area
++// PHYSTOP -- end RAM used by the kernel
++
++// qemu puts UART registers here in physical memory.
++#define UART0 0x10000000L
++#define UART0_IRQ 10
++
++// virtio mmio interface
++#define VIRTIO0 0x10001000
++#define VIRTIO0_IRQ 1
++
++// core local interruptor (CLINT), which contains the timer.
++#define CLINT 0x2000000L
++#define CLINT_MTIMECMP(hartid) (CLINT + 0x4000 + 8*(hartid))
++#define CLINT_MTIME (CLINT + 0xBFF8) // cycles since boot.
++
++// qemu puts platform-level interrupt controller (PLIC) here.
++#define PLIC 0x0c000000L
++#define PLIC_PRIORITY (PLIC + 0x0)
++#define PLIC_PENDING (PLIC + 0x1000)
++#define PLIC_MENABLE(hart) (PLIC + 0x2000 + (hart)*0x100)
++#define PLIC_SENABLE(hart) (PLIC + 0x2080 + (hart)*0x100)
++#define PLIC_MPRIORITY(hart) (PLIC + 0x200000 + (hart)*0x2000)
++#define PLIC_SPRIORITY(hart) (PLIC + 0x201000 + (hart)*0x2000)
++#define PLIC_MCLAIM(hart) (PLIC + 0x200004 + (hart)*0x2000)
++#define PLIC_SCLAIM(hart) (PLIC + 0x201004 + (hart)*0x2000)
++
++// the kernel expects there to be RAM
++// for use by the kernel and user pages
++// from physical address 0x80000000 to PHYSTOP.
++#define KERNBASE 0x80000000L
++#define PHYSTOP (KERNBASE + 128*1024*1024)
++
++// map the trampoline page to the highest address,
++// in both user and kernel space.
++#define TRAMPOLINE (MAXVA - PGSIZE)
++
++// map kernel stacks beneath the trampoline,
++// each surrounded by invalid guard pages.
++#define KSTACK(p) (TRAMPOLINE - ((p)+1)* 2*PGSIZE)
++
++// User memory layout.
++// Address zero first:
++//   text
++//   original data and bss
++//   fixed-size stack
++//   expandable heap
++//   ...
++//   TRAPFRAME (p->trapframe, used by the trampoline)
++//   TRAMPOLINE (the same page as in the kernel)
++#define TRAPFRAME (TRAMPOLINE - PGSIZE)
+diff --git a/kernel/printf.c b/kernel/printf.c
+index e1347de..c47c9b4 100644
+--- a/kernel/printf.c
++++ b/kernel/printf.c
+@@ -114,6 +114,21 @@ printf(char *fmt, ...)
+     release(&pr.lock);
+ }
+ 
++void
++backtrace(void)
++{
++  uint64 fp = r_fp();
++  uint64 bottom = PGROUNDDOWN(fp);
++  uint64 top = PGROUNDUP(fp);
++  
++  printf("backtrace:\n");
++  while(fp >= bottom && fp < top){
++    uint64 ra = *(uint64*)(fp - 8);
++    printf("%p\n", ra);
++    fp = *(uint64*)(fp - 16);
++  }
++}
++
+ void
+ panic(char *s)
+ {
+@@ -121,6 +136,7 @@ panic(char *s)
+   printf("panic: ");
+   printf(s);
+   printf("\n");
++  backtrace();
+   panicked = 1; // freeze uart output from other CPUs
+   for(;;)
+     ;
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..71419aa 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -1,656 +1,675 @@
+-#include "types.h"
+-#include "param.h"
+-#include "memlayout.h"
+-#include "riscv.h"
+-#include "spinlock.h"
+-#include "proc.h"
+-#include "defs.h"
+-
+-struct cpu cpus[NCPU];
+-
+-struct proc proc[NPROC];
+-
+-struct proc *initproc;
+-
+-int nextpid = 1;
+-struct spinlock pid_lock;
+-
+-extern void forkret(void);
+-static void freeproc(struct proc *p);
+-
+-extern char trampoline[]; // trampoline.S
+-
+-// helps ensure that wakeups of wait()ing
+-// parents are not lost. helps obey the
+-// memory model when using p->parent.
+-// must be acquired before any p->lock.
+-struct spinlock wait_lock;
+-
+-// Allocate a page for each process's kernel stack.
+-// Map it high in memory, followed by an invalid
+-// guard page.
+-void
+-proc_mapstacks(pagetable_t kpgtbl) {
+-  struct proc *p;
+-  
+-  for(p = proc; p < &proc[NPROC]; p++) {
+-    char *pa = kalloc();
+-    if(pa == 0)
+-      panic("kalloc");
+-    uint64 va = KSTACK((int) (p - proc));
+-    kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+-  }
+-}
+-
+-// initialize the proc table at boot time.
+-void
+-procinit(void)
+-{
+-  struct proc *p;
+-  
+-  initlock(&pid_lock, "nextpid");
+-  initlock(&wait_lock, "wait_lock");
+-  for(p = proc; p < &proc[NPROC]; p++) {
+-      initlock(&p->lock, "proc");
+-      p->kstack = KSTACK((int) (p - proc));
+-  }
+-}
+-
+-// Must be called with interrupts disabled,
+-// to prevent race with process being moved
+-// to a different CPU.
+-int
+-cpuid()
+-{
+-  int id = r_tp();
+-  return id;
+-}
+-
+-// Return this CPU's cpu struct.
+-// Interrupts must be disabled.
+-struct cpu*
+-mycpu(void) {
+-  int id = cpuid();
+-  struct cpu *c = &cpus[id];
+-  return c;
+-}
+-
+-// Return the current struct proc *, or zero if none.
+-struct proc*
+-myproc(void) {
+-  push_off();
+-  struct cpu *c = mycpu();
+-  struct proc *p = c->proc;
+-  pop_off();
+-  return p;
+-}
+-
+-int
+-allocpid() {
+-  int pid;
+-  
+-  acquire(&pid_lock);
+-  pid = nextpid;
+-  nextpid = nextpid + 1;
+-  release(&pid_lock);
+-
+-  return pid;
+-}
+-
+-// Look in the process table for an UNUSED proc.
+-// If found, initialize state required to run in the kernel,
+-// and return with p->lock held.
+-// If there are no free procs, or a memory allocation fails, return 0.
+-static struct proc*
+-allocproc(void)
+-{
+-  struct proc *p;
+-
+-  for(p = proc; p < &proc[NPROC]; p++) {
+-    acquire(&p->lock);
+-    if(p->state == UNUSED) {
+-      goto found;
+-    } else {
+-      release(&p->lock);
+-    }
+-  }
+-  return 0;
+-
+-found:
+-  p->pid = allocpid();
+-  p->state = USED;
+-
+-  // Allocate a trapframe page.
+-  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
+-    freeproc(p);
+-    release(&p->lock);
+-    return 0;
+-  }
+-
+-  // An empty user page table.
+-  p->pagetable = proc_pagetable(p);
+-  if(p->pagetable == 0){
+-    freeproc(p);
+-    release(&p->lock);
+-    return 0;
+-  }
+-
+-  // Set up new context to start executing at forkret,
+-  // which returns to user space.
+-  memset(&p->context, 0, sizeof(p->context));
+-  p->context.ra = (uint64)forkret;
+-  p->context.sp = p->kstack + PGSIZE;
+-
+-  return p;
+-}
+-
+-// free a proc structure and the data hanging from it,
+-// including user pages.
+-// p->lock must be held.
+-static void
+-freeproc(struct proc *p)
+-{
+-  if(p->trapframe)
+-    kfree((void*)p->trapframe);
+-  p->trapframe = 0;
+-  if(p->pagetable)
+-    proc_freepagetable(p->pagetable, p->sz);
+-  p->pagetable = 0;
+-  p->sz = 0;
+-  p->pid = 0;
+-  p->parent = 0;
+-  p->name[0] = 0;
+-  p->chan = 0;
+-  p->killed = 0;
+-  p->xstate = 0;
+-  p->state = UNUSED;
+-}
+-
+-// Create a user page table for a given process,
+-// with no user memory, but with trampoline pages.
+-pagetable_t
+-proc_pagetable(struct proc *p)
+-{
+-  pagetable_t pagetable;
+-
+-  // An empty page table.
+-  pagetable = uvmcreate();
+-  if(pagetable == 0)
+-    return 0;
+-
+-  // map the trampoline code (for system call return)
+-  // at the highest user virtual address.
+-  // only the supervisor uses it, on the way
+-  // to/from user space, so not PTE_U.
+-  if(mappages(pagetable, TRAMPOLINE, PGSIZE,
+-              (uint64)trampoline, PTE_R | PTE_X) < 0){
+-    uvmfree(pagetable, 0);
+-    return 0;
+-  }
+-
+-  // map the trapframe just below TRAMPOLINE, for trampoline.S.
+-  if(mappages(pagetable, TRAPFRAME, PGSIZE,
+-              (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
+-    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+-    uvmfree(pagetable, 0);
+-    return 0;
+-  }
+-
+-  return pagetable;
+-}
+-
+-// Free a process's page table, and free the
+-// physical memory it refers to.
+-void
+-proc_freepagetable(pagetable_t pagetable, uint64 sz)
+-{
+-  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+-  uvmunmap(pagetable, TRAPFRAME, 1, 0);
+-  uvmfree(pagetable, sz);
+-}
+-
+-// a user program that calls exec("/init")
+-// od -t xC initcode
+-uchar initcode[] = {
+-  0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02,
+-  0x97, 0x05, 0x00, 0x00, 0x93, 0x85, 0x35, 0x02,
+-  0x93, 0x08, 0x70, 0x00, 0x73, 0x00, 0x00, 0x00,
+-  0x93, 0x08, 0x20, 0x00, 0x73, 0x00, 0x00, 0x00,
+-  0xef, 0xf0, 0x9f, 0xff, 0x2f, 0x69, 0x6e, 0x69,
+-  0x74, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00,
+-  0x00, 0x00, 0x00, 0x00
+-};
+-
+-// Set up first user process.
+-void
+-userinit(void)
+-{
+-  struct proc *p;
+-
+-  p = allocproc();
+-  initproc = p;
+-  
+-  // allocate one user page and copy init's instructions
+-  // and data into it.
+-  uvminit(p->pagetable, initcode, sizeof(initcode));
+-  p->sz = PGSIZE;
+-
+-  // prepare for the very first "return" from kernel to user.
+-  p->trapframe->epc = 0;      // user program counter
+-  p->trapframe->sp = PGSIZE;  // user stack pointer
+-
+-  safestrcpy(p->name, "initcode", sizeof(p->name));
+-  p->cwd = namei("/");
+-
+-  p->state = RUNNABLE;
+-
+-  release(&p->lock);
+-}
+-
+-// Grow or shrink user memory by n bytes.
+-// Return 0 on success, -1 on failure.
+-int
+-growproc(int n)
+-{
+-  uint sz;
+-  struct proc *p = myproc();
+-
+-  sz = p->sz;
+-  if(n > 0){
+-    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+-      return -1;
+-    }
+-  } else if(n < 0){
+-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+-  }
+-  p->sz = sz;
+-  return 0;
+-}
+-
+-// Create a new process, copying the parent.
+-// Sets up child kernel stack to return as if from fork() system call.
+-int
+-fork(void)
+-{
+-  int i, pid;
+-  struct proc *np;
+-  struct proc *p = myproc();
+-
+-  // Allocate process.
+-  if((np = allocproc()) == 0){
+-    return -1;
+-  }
+-
+-  // Copy user memory from parent to child.
+-  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
+-    freeproc(np);
+-    release(&np->lock);
+-    return -1;
+-  }
+-  np->sz = p->sz;
+-
+-  // copy saved user registers.
+-  *(np->trapframe) = *(p->trapframe);
+-
+-  // Cause fork to return 0 in the child.
+-  np->trapframe->a0 = 0;
+-
+-  // increment reference counts on open file descriptors.
+-  for(i = 0; i < NOFILE; i++)
+-    if(p->ofile[i])
+-      np->ofile[i] = filedup(p->ofile[i]);
+-  np->cwd = idup(p->cwd);
+-
+-  safestrcpy(np->name, p->name, sizeof(p->name));
+-
+-  pid = np->pid;
+-
+-  release(&np->lock);
+-
+-  acquire(&wait_lock);
+-  np->parent = p;
+-  release(&wait_lock);
+-
+-  acquire(&np->lock);
+-  np->state = RUNNABLE;
+-  release(&np->lock);
+-
+-  return pid;
+-}
+-
+-// Pass p's abandoned children to init.
+-// Caller must hold wait_lock.
+-void
+-reparent(struct proc *p)
+-{
+-  struct proc *pp;
+-
+-  for(pp = proc; pp < &proc[NPROC]; pp++){
+-    if(pp->parent == p){
+-      pp->parent = initproc;
+-      wakeup(initproc);
+-    }
+-  }
+-}
+-
+-// Exit the current process.  Does not return.
+-// An exited process remains in the zombie state
+-// until its parent calls wait().
+-void
+-exit(int status)
+-{
+-  struct proc *p = myproc();
+-
+-  if(p == initproc)
+-    panic("init exiting");
+-
+-  // Close all open files.
+-  for(int fd = 0; fd < NOFILE; fd++){
+-    if(p->ofile[fd]){
+-      struct file *f = p->ofile[fd];
+-      fileclose(f);
+-      p->ofile[fd] = 0;
+-    }
+-  }
+-
+-  begin_op();
+-  iput(p->cwd);
+-  end_op();
+-  p->cwd = 0;
+-
+-  acquire(&wait_lock);
+-
+-  // Give any children to init.
+-  reparent(p);
+-
+-  // Parent might be sleeping in wait().
+-  wakeup(p->parent);
+-  
+-  acquire(&p->lock);
+-
+-  p->xstate = status;
+-  p->state = ZOMBIE;
+-
+-  release(&wait_lock);
+-
+-  // Jump into the scheduler, never to return.
+-  sched();
+-  panic("zombie exit");
+-}
+-
+-// Wait for a child process to exit and return its pid.
+-// Return -1 if this process has no children.
+-int
+-wait(uint64 addr)
+-{
+-  struct proc *np;
+-  int havekids, pid;
+-  struct proc *p = myproc();
+-
+-  acquire(&wait_lock);
+-
+-  for(;;){
+-    // Scan through table looking for exited children.
+-    havekids = 0;
+-    for(np = proc; np < &proc[NPROC]; np++){
+-      if(np->parent == p){
+-        // make sure the child isn't still in exit() or swtch().
+-        acquire(&np->lock);
+-
+-        havekids = 1;
+-        if(np->state == ZOMBIE){
+-          // Found one.
+-          pid = np->pid;
+-          if(addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate,
+-                                  sizeof(np->xstate)) < 0) {
+-            release(&np->lock);
+-            release(&wait_lock);
+-            return -1;
+-          }
+-          freeproc(np);
+-          release(&np->lock);
+-          release(&wait_lock);
+-          return pid;
+-        }
+-        release(&np->lock);
+-      }
+-    }
+-
+-    // No point waiting if we don't have any children.
+-    if(!havekids || p->killed){
+-      release(&wait_lock);
+-      return -1;
+-    }
+-    
+-    // Wait for a child to exit.
+-    sleep(p, &wait_lock);  //DOC: wait-sleep
+-  }
+-}
+-
+-// Per-CPU process scheduler.
+-// Each CPU calls scheduler() after setting itself up.
+-// Scheduler never returns.  It loops, doing:
+-//  - choose a process to run.
+-//  - swtch to start running that process.
+-//  - eventually that process transfers control
+-//    via swtch back to the scheduler.
+-void
+-scheduler(void)
+-{
+-  struct proc *p;
+-  struct cpu *c = mycpu();
+-  
+-  c->proc = 0;
+-  for(;;){
+-    // Avoid deadlock by ensuring that devices can interrupt.
+-    intr_on();
+-
+-    for(p = proc; p < &proc[NPROC]; p++) {
+-      acquire(&p->lock);
+-      if(p->state == RUNNABLE) {
+-        // Switch to chosen process.  It is the process's job
+-        // to release its lock and then reacquire it
+-        // before jumping back to us.
+-        p->state = RUNNING;
+-        c->proc = p;
+-        swtch(&c->context, &p->context);
+-
+-        // Process is done running for now.
+-        // It should have changed its p->state before coming back.
+-        c->proc = 0;
+-      }
+-      release(&p->lock);
+-    }
+-  }
+-}
+-
+-// Switch to scheduler.  Must hold only p->lock
+-// and have changed proc->state. Saves and restores
+-// intena because intena is a property of this
+-// kernel thread, not this CPU. It should
+-// be proc->intena and proc->noff, but that would
+-// break in the few places where a lock is held but
+-// there's no process.
+-void
+-sched(void)
+-{
+-  int intena;
+-  struct proc *p = myproc();
+-
+-  if(!holding(&p->lock))
+-    panic("sched p->lock");
+-  if(mycpu()->noff != 1)
+-    panic("sched locks");
+-  if(p->state == RUNNING)
+-    panic("sched running");
+-  if(intr_get())
+-    panic("sched interruptible");
+-
+-  intena = mycpu()->intena;
+-  swtch(&p->context, &mycpu()->context);
+-  mycpu()->intena = intena;
+-}
+-
+-// Give up the CPU for one scheduling round.
+-void
+-yield(void)
+-{
+-  struct proc *p = myproc();
+-  acquire(&p->lock);
+-  p->state = RUNNABLE;
+-  sched();
+-  release(&p->lock);
+-}
+-
+-// A fork child's very first scheduling by scheduler()
+-// will swtch to forkret.
+-void
+-forkret(void)
+-{
+-  static int first = 1;
+-
+-  // Still holding p->lock from scheduler.
+-  release(&myproc()->lock);
+-
+-  if (first) {
+-    // File system initialization must be run in the context of a
+-    // regular process (e.g., because it calls sleep), and thus cannot
+-    // be run from main().
+-    first = 0;
+-    fsinit(ROOTDEV);
+-  }
+-
+-  usertrapret();
+-}
+-
+-// Atomically release lock and sleep on chan.
+-// Reacquires lock when awakened.
+-void
+-sleep(void *chan, struct spinlock *lk)
+-{
+-  struct proc *p = myproc();
+-  
+-  // Must acquire p->lock in order to
+-  // change p->state and then call sched.
+-  // Once we hold p->lock, we can be
+-  // guaranteed that we won't miss any wakeup
+-  // (wakeup locks p->lock),
+-  // so it's okay to release lk.
+-
+-  acquire(&p->lock);  //DOC: sleeplock1
+-  release(lk);
+-
+-  // Go to sleep.
+-  p->chan = chan;
+-  p->state = SLEEPING;
+-
+-  sched();
+-
+-  // Tidy up.
+-  p->chan = 0;
+-
+-  // Reacquire original lock.
+-  release(&p->lock);
+-  acquire(lk);
+-}
+-
+-// Wake up all processes sleeping on chan.
+-// Must be called without any p->lock.
+-void
+-wakeup(void *chan)
+-{
+-  struct proc *p;
+-
+-  for(p = proc; p < &proc[NPROC]; p++) {
+-    if(p != myproc()){
+-      acquire(&p->lock);
+-      if(p->state == SLEEPING && p->chan == chan) {
+-        p->state = RUNNABLE;
+-      }
+-      release(&p->lock);
+-    }
+-  }
+-}
+-
+-// Kill the process with the given pid.
+-// The victim won't exit until it tries to return
+-// to user space (see usertrap() in trap.c).
+-int
+-kill(int pid)
+-{
+-  struct proc *p;
+-
+-  for(p = proc; p < &proc[NPROC]; p++){
+-    acquire(&p->lock);
+-    if(p->pid == pid){
+-      p->killed = 1;
+-      if(p->state == SLEEPING){
+-        // Wake process from sleep().
+-        p->state = RUNNABLE;
+-      }
+-      release(&p->lock);
+-      return 0;
+-    }
+-    release(&p->lock);
+-  }
+-  return -1;
+-}
+-
+-// Copy to either a user address, or kernel address,
+-// depending on usr_dst.
+-// Returns 0 on success, -1 on error.
+-int
+-either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
+-{
+-  struct proc *p = myproc();
+-  if(user_dst){
+-    return copyout(p->pagetable, dst, src, len);
+-  } else {
+-    memmove((char *)dst, src, len);
+-    return 0;
+-  }
+-}
+-
+-// Copy from either a user address, or kernel address,
+-// depending on usr_src.
+-// Returns 0 on success, -1 on error.
+-int
+-either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+-{
+-  struct proc *p = myproc();
+-  if(user_src){
+-    return copyin(p->pagetable, dst, src, len);
+-  } else {
+-    memmove(dst, (char*)src, len);
+-    return 0;
+-  }
+-}
+-
+-// Print a process listing to console.  For debugging.
+-// Runs when user types ^P on console.
+-// No lock to avoid wedging a stuck machine further.
+-void
+-procdump(void)
+-{
+-  static char *states[] = {
+-  [UNUSED]    "unused",
+-  [SLEEPING]  "sleep ",
+-  [RUNNABLE]  "runble",
+-  [RUNNING]   "run   ",
+-  [ZOMBIE]    "zombie"
+-  };
+-  struct proc *p;
+-  char *state;
+-
+-  printf("\n");
+-  for(p = proc; p < &proc[NPROC]; p++){
+-    if(p->state == UNUSED)
+-      continue;
+-    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
+-      state = states[p->state];
+-    else
+-      state = "???";
+-    printf("%d %s %s", p->pid, state, p->name);
+-    printf("\n");
+-  }
+-}
++#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "defs.h"
++
++struct cpu cpus[NCPU];
++
++struct proc proc[NPROC];
++
++struct proc *initproc;
++
++int nextpid = 1;
++struct spinlock pid_lock;
++
++extern void forkret(void);
++static void freeproc(struct proc *p);
++
++extern char trampoline[]; // trampoline.S
++
++// helps ensure that wakeups of wait()ing
++// parents are not lost. helps obey the
++// memory model when using p->parent.
++// must be acquired before any p->lock.
++struct spinlock wait_lock;
++
++// Allocate a page for each process's kernel stack.
++// Map it high in memory, followed by an invalid
++// guard page.
++void
++proc_mapstacks(pagetable_t kpgtbl) {
++  struct proc *p;
++  
++  for(p = proc; p < &proc[NPROC]; p++) {
++    char *pa = kalloc();
++    if(pa == 0)
++      panic("kalloc");
++    uint64 va = KSTACK((int) (p - proc));
++    kvmmap(kpgtbl, va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
++  }
++}
++
++// initialize the proc table at boot time.
++void
++procinit(void)
++{
++  struct proc *p;
++  
++  initlock(&pid_lock, "nextpid");
++  initlock(&wait_lock, "wait_lock");
++  for(p = proc; p < &proc[NPROC]; p++) {
++      initlock(&p->lock, "proc");
++      p->kstack = KSTACK((int) (p - proc));
++  }
++}
++
++// Must be called with interrupts disabled,
++// to prevent race with process being moved
++// to a different CPU.
++int
++cpuid()
++{
++  int id = r_tp();
++  return id;
++}
++
++// Return this CPU's cpu struct.
++// Interrupts must be disabled.
++struct cpu*
++mycpu(void) {
++  int id = cpuid();
++  struct cpu *c = &cpus[id];
++  return c;
++}
++
++// Return the current struct proc *, or zero if none.
++struct proc*
++myproc(void) {
++  push_off();
++  struct cpu *c = mycpu();
++  struct proc *p = c->proc;
++  pop_off();
++  return p;
++}
++
++int
++allocpid() {
++  int pid;
++  
++  acquire(&pid_lock);
++  pid = nextpid;
++  nextpid = nextpid + 1;
++  release(&pid_lock);
++
++  return pid;
++}
++
++// Look in the process table for an UNUSED proc.
++// If found, initialize state required to run in the kernel,
++// and return with p->lock held.
++// If there are no free procs, or a memory allocation fails, return 0.
++static struct proc*
++allocproc(void)
++{
++  struct proc *p;
++
++  for(p = proc; p < &proc[NPROC]; p++) {
++    acquire(&p->lock);
++    if(p->state == UNUSED) {
++      goto found;
++    } else {
++      release(&p->lock);
++    }
++  }
++  return 0;
++
++found:
++  p->pid = allocpid();
++  p->state = USED;
++
++  // Allocate a trapframe page.
++  if((p->trapframe = (struct trapframe *)kalloc()) == 0){
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++
++  // Allocate an alarm trapframe copy page.
++  if((p->alarm_tf_copy = (struct trapframe *)kalloc()) == 0){
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++
++  p->alarm_interval = 0;
++  p->alarm_handler = 0;
++  p->alarm_ticks = 0;
++  p->alarm_is_running = 0;
++
++  // An empty user page table.
++  p->pagetable = proc_pagetable(p);
++  if(p->pagetable == 0){
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++
++  // Set up new context to start executing at forkret,
++  // which returns to user space.
++  memset(&p->context, 0, sizeof(p->context));
++  p->context.ra = (uint64)forkret;
++  p->context.sp = p->kstack + PGSIZE;
++
++  return p;
++}
++
++// free a proc structure and the data hanging from it,
++// including user pages.
++// p->lock must be held.
++static void
++freeproc(struct proc *p)
++{
++  if(p->trapframe)
++    kfree((void*)p->trapframe);
++  p->trapframe = 0;
++  if(p->alarm_tf_copy)
++    kfree((void*)p->alarm_tf_copy);
++  p->alarm_tf_copy = 0;
++  p->alarm_interval = 0;
++  p->alarm_handler = 0;
++  p->alarm_ticks = 0;
++  p->alarm_is_running = 0;
++  if(p->pagetable)
++    proc_freepagetable(p->pagetable, p->sz);
++  p->pagetable = 0;
++  p->sz = 0;
++  p->pid = 0;
++  p->parent = 0;
++  p->name[0] = 0;
++  p->chan = 0;
++  p->killed = 0;
++  p->xstate = 0;
++  p->state = UNUSED;
++}
++
++// Create a user page table for a given process,
++// with no user memory, but with trampoline pages.
++pagetable_t
++proc_pagetable(struct proc *p)
++{
++  pagetable_t pagetable;
++
++  // An empty page table.
++  pagetable = uvmcreate();
++  if(pagetable == 0)
++    return 0;
++
++  // map the trampoline code (for system call return)
++  // at the highest user virtual address.
++  // only the supervisor uses it, on the way
++  // to/from user space, so not PTE_U.
++  if(mappages(pagetable, TRAMPOLINE, PGSIZE,
++              (uint64)trampoline, PTE_R | PTE_X) < 0){
++    uvmfree(pagetable, 0);
++    return 0;
++  }
++
++  // map the trapframe just below TRAMPOLINE, for trampoline.S.
++  if(mappages(pagetable, TRAPFRAME, PGSIZE,
++              (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
++    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++    uvmfree(pagetable, 0);
++    return 0;
++  }
++
++  return pagetable;
++}
++
++// Free a process's page table, and free the
++// physical memory it refers to.
++void
++proc_freepagetable(pagetable_t pagetable, uint64 sz)
++{
++  uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++  uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmfree(pagetable, sz);
++}
++
++// a user program that calls exec("/init")
++// od -t xC initcode
++uchar initcode[] = {
++  0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02,
++  0x97, 0x05, 0x00, 0x00, 0x93, 0x85, 0x35, 0x02,
++  0x93, 0x08, 0x70, 0x00, 0x73, 0x00, 0x00, 0x00,
++  0x93, 0x08, 0x20, 0x00, 0x73, 0x00, 0x00, 0x00,
++  0xef, 0xf0, 0x9f, 0xff, 0x2f, 0x69, 0x6e, 0x69,
++  0x74, 0x00, 0x00, 0x24, 0x00, 0x00, 0x00, 0x00,
++  0x00, 0x00, 0x00, 0x00
++};
++
++// Set up first user process.
++void
++userinit(void)
++{
++  struct proc *p;
++
++  p = allocproc();
++  initproc = p;
++  
++  // allocate one user page and copy init's instructions
++  // and data into it.
++  uvminit(p->pagetable, initcode, sizeof(initcode));
++  p->sz = PGSIZE;
++
++  // prepare for the very first "return" from kernel to user.
++  p->trapframe->epc = 0;      // user program counter
++  p->trapframe->sp = PGSIZE;  // user stack pointer
++
++  safestrcpy(p->name, "initcode", sizeof(p->name));
++  p->cwd = namei("/");
++
++  p->state = RUNNABLE;
++
++  release(&p->lock);
++}
++
++// Grow or shrink user memory by n bytes.
++// Return 0 on success, -1 on failure.
++int
++growproc(int n)
++{
++  uint sz;
++  struct proc *p = myproc();
++
++  sz = p->sz;
++  if(n > 0){
++    if((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
++      return -1;
++    }
++  } else if(n < 0){
++    sz = uvmdealloc(p->pagetable, sz, sz + n);
++  }
++  p->sz = sz;
++  return 0;
++}
++
++// Create a new process, copying the parent.
++// Sets up child kernel stack to return as if from fork() system call.
++int
++fork(void)
++{
++  int i, pid;
++  struct proc *np;
++  struct proc *p = myproc();
++
++  // Allocate process.
++  if((np = allocproc()) == 0){
++    return -1;
++  }
++
++  // Copy user memory from parent to child.
++  if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
++    freeproc(np);
++    release(&np->lock);
++    return -1;
++  }
++  np->sz = p->sz;
++
++  // copy saved user registers.
++  *(np->trapframe) = *(p->trapframe);
++
++  // Cause fork to return 0 in the child.
++  np->trapframe->a0 = 0;
++
++  // increment reference counts on open file descriptors.
++  for(i = 0; i < NOFILE; i++)
++    if(p->ofile[i])
++      np->ofile[i] = filedup(p->ofile[i]);
++  np->cwd = idup(p->cwd);
++
++  safestrcpy(np->name, p->name, sizeof(p->name));
++
++  pid = np->pid;
++
++  release(&np->lock);
++
++  acquire(&wait_lock);
++  np->parent = p;
++  release(&wait_lock);
++
++  acquire(&np->lock);
++  np->state = RUNNABLE;
++  release(&np->lock);
++
++  return pid;
++}
++
++// Pass p's abandoned children to init.
++// Caller must hold wait_lock.
++void
++reparent(struct proc *p)
++{
++  struct proc *pp;
++
++  for(pp = proc; pp < &proc[NPROC]; pp++){
++    if(pp->parent == p){
++      pp->parent = initproc;
++      wakeup(initproc);
++    }
++  }
++}
++
++// Exit the current process.  Does not return.
++// An exited process remains in the zombie state
++// until its parent calls wait().
++void
++exit(int status)
++{
++  struct proc *p = myproc();
++
++  if(p == initproc)
++    panic("init exiting");
++
++  // Close all open files.
++  for(int fd = 0; fd < NOFILE; fd++){
++    if(p->ofile[fd]){
++      struct file *f = p->ofile[fd];
++      fileclose(f);
++      p->ofile[fd] = 0;
++    }
++  }
++
++  begin_op();
++  iput(p->cwd);
++  end_op();
++  p->cwd = 0;
++
++  acquire(&wait_lock);
++
++  // Give any children to init.
++  reparent(p);
++
++  // Parent might be sleeping in wait().
++  wakeup(p->parent);
++  
++  acquire(&p->lock);
++
++  p->xstate = status;
++  p->state = ZOMBIE;
++
++  release(&wait_lock);
++
++  // Jump into the scheduler, never to return.
++  sched();
++  panic("zombie exit");
++}
++
++// Wait for a child process to exit and return its pid.
++// Return -1 if this process has no children.
++int
++wait(uint64 addr)
++{
++  struct proc *np;
++  int havekids, pid;
++  struct proc *p = myproc();
++
++  acquire(&wait_lock);
++
++  for(;;){
++    // Scan through table looking for exited children.
++    havekids = 0;
++    for(np = proc; np < &proc[NPROC]; np++){
++      if(np->parent == p){
++        // make sure the child isn't still in exit() or swtch().
++        acquire(&np->lock);
++
++        havekids = 1;
++        if(np->state == ZOMBIE){
++          // Found one.
++          pid = np->pid;
++          if(addr != 0 && copyout(p->pagetable, addr, (char *)&np->xstate,
++                                  sizeof(np->xstate)) < 0) {
++            release(&np->lock);
++            release(&wait_lock);
++            return -1;
++          }
++          freeproc(np);
++          release(&np->lock);
++          release(&wait_lock);
++          return pid;
++        }
++        release(&np->lock);
++      }
++    }
++
++    // No point waiting if we don't have any children.
++    if(!havekids || p->killed){
++      release(&wait_lock);
++      return -1;
++    }
++    
++    // Wait for a child to exit.
++    sleep(p, &wait_lock);  //DOC: wait-sleep
++  }
++}
++
++// Per-CPU process scheduler.
++// Each CPU calls scheduler() after setting itself up.
++// Scheduler never returns.  It loops, doing:
++//  - choose a process to run.
++//  - swtch to start running that process.
++//  - eventually that process transfers control
++//    via swtch back to the scheduler.
++void
++scheduler(void)
++{
++  struct proc *p;
++  struct cpu *c = mycpu();
++  
++  c->proc = 0;
++  for(;;){
++    // Avoid deadlock by ensuring that devices can interrupt.
++    intr_on();
++
++    for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->state == RUNNABLE) {
++        // Switch to chosen process.  It is the process's job
++        // to release its lock and then reacquire it
++        // before jumping back to us.
++        p->state = RUNNING;
++        c->proc = p;
++        swtch(&c->context, &p->context);
++
++        // Process is done running for now.
++        // It should have changed its p->state before coming back.
++        c->proc = 0;
++      }
++      release(&p->lock);
++    }
++  }
++}
++
++// Switch to scheduler.  Must hold only p->lock
++// and have changed proc->state. Saves and restores
++// intena because intena is a property of this
++// kernel thread, not this CPU. It should
++// be proc->intena and proc->noff, but that would
++// break in the few places where a lock is held but
++// there's no process.
++void
++sched(void)
++{
++  int intena;
++  struct proc *p = myproc();
++
++  if(!holding(&p->lock))
++    panic("sched p->lock");
++  if(mycpu()->noff != 1)
++    panic("sched locks");
++  if(p->state == RUNNING)
++    panic("sched running");
++  if(intr_get())
++    panic("sched interruptible");
++
++  intena = mycpu()->intena;
++  swtch(&p->context, &mycpu()->context);
++  mycpu()->intena = intena;
++}
++
++// Give up the CPU for one scheduling round.
++void
++yield(void)
++{
++  struct proc *p = myproc();
++  acquire(&p->lock);
++  p->state = RUNNABLE;
++  sched();
++  release(&p->lock);
++}
++
++// A fork child's very first scheduling by scheduler()
++// will swtch to forkret.
++void
++forkret(void)
++{
++  static int first = 1;
++
++  // Still holding p->lock from scheduler.
++  release(&myproc()->lock);
++
++  if (first) {
++    // File system initialization must be run in the context of a
++    // regular process (e.g., because it calls sleep), and thus cannot
++    // be run from main().
++    first = 0;
++    fsinit(ROOTDEV);
++  }
++
++  usertrapret();
++}
++
++// Atomically release lock and sleep on chan.
++// Reacquires lock when awakened.
++void
++sleep(void *chan, struct spinlock *lk)
++{
++  struct proc *p = myproc();
++  
++  // Must acquire p->lock in order to
++  // change p->state and then call sched.
++  // Once we hold p->lock, we can be
++  // guaranteed that we won't miss any wakeup
++  // (wakeup locks p->lock),
++  // so it's okay to release lk.
++
++  acquire(&p->lock);  //DOC: sleeplock1
++  release(lk);
++
++  // Go to sleep.
++  p->chan = chan;
++  p->state = SLEEPING;
++
++  sched();
++
++  // Tidy up.
++  p->chan = 0;
++
++  // Reacquire original lock.
++  release(&p->lock);
++  acquire(lk);
++}
++
++// Wake up all processes sleeping on chan.
++// Must be called without any p->lock.
++void
++wakeup(void *chan)
++{
++  struct proc *p;
++
++  for(p = proc; p < &proc[NPROC]; p++) {
++    if(p != myproc()){
++      acquire(&p->lock);
++      if(p->state == SLEEPING && p->chan == chan) {
++        p->state = RUNNABLE;
++      }
++      release(&p->lock);
++    }
++  }
++}
++
++// Kill the process with the given pid.
++// The victim won't exit until it tries to return
++// to user space (see usertrap() in trap.c).
++int
++kill(int pid)
++{
++  struct proc *p;
++
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++    if(p->pid == pid){
++      p->killed = 1;
++      if(p->state == SLEEPING){
++        // Wake process from sleep().
++        p->state = RUNNABLE;
++      }
++      release(&p->lock);
++      return 0;
++    }
++    release(&p->lock);
++  }
++  return -1;
++}
++
++// Copy to either a user address, or kernel address,
++// depending on usr_dst.
++// Returns 0 on success, -1 on error.
++int
++either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
++{
++  struct proc *p = myproc();
++  if(user_dst){
++    return copyout(p->pagetable, dst, src, len);
++  } else {
++    memmove((char *)dst, src, len);
++    return 0;
++  }
++}
++
++// Copy from either a user address, or kernel address,
++// depending on usr_src.
++// Returns 0 on success, -1 on error.
++int
++either_copyin(void *dst, int user_src, uint64 src, uint64 len)
++{
++  struct proc *p = myproc();
++  if(user_src){
++    return copyin(p->pagetable, dst, src, len);
++  } else {
++    memmove(dst, (char*)src, len);
++    return 0;
++  }
++}
++
++// Print a process listing to console.  For debugging.
++// Runs when user types ^P on console.
++// No lock to avoid wedging a stuck machine further.
++void
++procdump(void)
++{
++  static char *states[] = {
++  [UNUSED]    "unused",
++  [SLEEPING]  "sleep ",
++  [RUNNABLE]  "runble",
++  [RUNNING]   "run   ",
++  [ZOMBIE]    "zombie"
++  };
++  struct proc *p;
++  char *state;
++
++  printf("\n");
++  for(p = proc; p < &proc[NPROC]; p++){
++    if(p->state == UNUSED)
++      continue;
++    if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
++      state = states[p->state];
++    else
++      state = "???";
++    printf("%d %s %s", p->pid, state, p->name);
++    printf("\n");
++  }
++}
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..710eaf5 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -1,108 +1,114 @@
+-// Saved registers for kernel context switches.
+-struct context {
+-  uint64 ra;
+-  uint64 sp;
+-
+-  // callee-saved
+-  uint64 s0;
+-  uint64 s1;
+-  uint64 s2;
+-  uint64 s3;
+-  uint64 s4;
+-  uint64 s5;
+-  uint64 s6;
+-  uint64 s7;
+-  uint64 s8;
+-  uint64 s9;
+-  uint64 s10;
+-  uint64 s11;
+-};
+-
+-// Per-CPU state.
+-struct cpu {
+-  struct proc *proc;          // The process running on this cpu, or null.
+-  struct context context;     // swtch() here to enter scheduler().
+-  int noff;                   // Depth of push_off() nesting.
+-  int intena;                 // Were interrupts enabled before push_off()?
+-};
+-
+-extern struct cpu cpus[NCPU];
+-
+-// per-process data for the trap handling code in trampoline.S.
+-// sits in a page by itself just under the trampoline page in the
+-// user page table. not specially mapped in the kernel page table.
+-// the sscratch register points here.
+-// uservec in trampoline.S saves user registers in the trapframe,
+-// then initializes registers from the trapframe's
+-// kernel_sp, kernel_hartid, kernel_satp, and jumps to kernel_trap.
+-// usertrapret() and userret in trampoline.S set up
+-// the trapframe's kernel_*, restore user registers from the
+-// trapframe, switch to the user page table, and enter user space.
+-// the trapframe includes callee-saved user registers like s0-s11 because the
+-// return-to-user path via usertrapret() doesn't return through
+-// the entire kernel call stack.
+-struct trapframe {
+-  /*   0 */ uint64 kernel_satp;   // kernel page table
+-  /*   8 */ uint64 kernel_sp;     // top of process's kernel stack
+-  /*  16 */ uint64 kernel_trap;   // usertrap()
+-  /*  24 */ uint64 epc;           // saved user program counter
+-  /*  32 */ uint64 kernel_hartid; // saved kernel tp
+-  /*  40 */ uint64 ra;
+-  /*  48 */ uint64 sp;
+-  /*  56 */ uint64 gp;
+-  /*  64 */ uint64 tp;
+-  /*  72 */ uint64 t0;
+-  /*  80 */ uint64 t1;
+-  /*  88 */ uint64 t2;
+-  /*  96 */ uint64 s0;
+-  /* 104 */ uint64 s1;
+-  /* 112 */ uint64 a0;
+-  /* 120 */ uint64 a1;
+-  /* 128 */ uint64 a2;
+-  /* 136 */ uint64 a3;
+-  /* 144 */ uint64 a4;
+-  /* 152 */ uint64 a5;
+-  /* 160 */ uint64 a6;
+-  /* 168 */ uint64 a7;
+-  /* 176 */ uint64 s2;
+-  /* 184 */ uint64 s3;
+-  /* 192 */ uint64 s4;
+-  /* 200 */ uint64 s5;
+-  /* 208 */ uint64 s6;
+-  /* 216 */ uint64 s7;
+-  /* 224 */ uint64 s8;
+-  /* 232 */ uint64 s9;
+-  /* 240 */ uint64 s10;
+-  /* 248 */ uint64 s11;
+-  /* 256 */ uint64 t3;
+-  /* 264 */ uint64 t4;
+-  /* 272 */ uint64 t5;
+-  /* 280 */ uint64 t6;
+-};
+-
+-enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+-
+-// Per-process state
+-struct proc {
+-  struct spinlock lock;
+-
+-  // p->lock must be held when using these:
+-  enum procstate state;        // Process state
+-  void *chan;                  // If non-zero, sleeping on chan
+-  int killed;                  // If non-zero, have been killed
+-  int xstate;                  // Exit status to be returned to parent's wait
+-  int pid;                     // Process ID
+-
+-  // wait_lock must be held when using this:
+-  struct proc *parent;         // Parent process
+-
+-  // these are private to the process, so p->lock need not be held.
+-  uint64 kstack;               // Virtual address of kernel stack
+-  uint64 sz;                   // Size of process memory (bytes)
+-  pagetable_t pagetable;       // User page table
+-  struct trapframe *trapframe; // data page for trampoline.S
+-  struct context context;      // swtch() here to run process
+-  struct file *ofile[NOFILE];  // Open files
+-  struct inode *cwd;           // Current directory
+-  char name[16];               // Process name (debugging)
+-};
++// Saved registers for kernel context switches.
++struct context {
++  uint64 ra;
++  uint64 sp;
++
++  // callee-saved
++  uint64 s0;
++  uint64 s1;
++  uint64 s2;
++  uint64 s3;
++  uint64 s4;
++  uint64 s5;
++  uint64 s6;
++  uint64 s7;
++  uint64 s8;
++  uint64 s9;
++  uint64 s10;
++  uint64 s11;
++};
++
++// Per-CPU state.
++struct cpu {
++  struct proc *proc;          // The process running on this cpu, or null.
++  struct context context;     // swtch() here to enter scheduler().
++  int noff;                   // Depth of push_off() nesting.
++  int intena;                 // Were interrupts enabled before push_off()?
++};
++
++extern struct cpu cpus[NCPU];
++
++// per-process data for the trap handling code in trampoline.S.
++// sits in a page by itself just under the trampoline page in the
++// user page table. not specially mapped in the kernel page table.
++// the sscratch register points here.
++// uservec in trampoline.S saves user registers in the trapframe,
++// then initializes registers from the trapframe's
++// kernel_sp, kernel_hartid, kernel_satp, and jumps to kernel_trap.
++// usertrapret() and userret in trampoline.S set up
++// the trapframe's kernel_*, restore user registers from the
++// trapframe, switch to the user page table, and enter user space.
++// the trapframe includes callee-saved user registers like s0-s11 because the
++// return-to-user path via usertrapret() doesn't return through
++// the entire kernel call stack.
++struct trapframe {
++  /*   0 */ uint64 kernel_satp;   // kernel page table
++  /*   8 */ uint64 kernel_sp;     // top of process's kernel stack
++  /*  16 */ uint64 kernel_trap;   // usertrap()
++  /*  24 */ uint64 epc;           // saved user program counter
++  /*  32 */ uint64 kernel_hartid; // saved kernel tp
++  /*  40 */ uint64 ra;
++  /*  48 */ uint64 sp;
++  /*  56 */ uint64 gp;
++  /*  64 */ uint64 tp;
++  /*  72 */ uint64 t0;
++  /*  80 */ uint64 t1;
++  /*  88 */ uint64 t2;
++  /*  96 */ uint64 s0;
++  /* 104 */ uint64 s1;
++  /* 112 */ uint64 a0;
++  /* 120 */ uint64 a1;
++  /* 128 */ uint64 a2;
++  /* 136 */ uint64 a3;
++  /* 144 */ uint64 a4;
++  /* 152 */ uint64 a5;
++  /* 160 */ uint64 a6;
++  /* 168 */ uint64 a7;
++  /* 176 */ uint64 s2;
++  /* 184 */ uint64 s3;
++  /* 192 */ uint64 s4;
++  /* 200 */ uint64 s5;
++  /* 208 */ uint64 s6;
++  /* 216 */ uint64 s7;
++  /* 224 */ uint64 s8;
++  /* 232 */ uint64 s9;
++  /* 240 */ uint64 s10;
++  /* 248 */ uint64 s11;
++  /* 256 */ uint64 t3;
++  /* 264 */ uint64 t4;
++  /* 272 */ uint64 t5;
++  /* 280 */ uint64 t6;
++};
++
++enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
++
++// Per-process state
++struct proc {
++  struct spinlock lock;
++
++  // p->lock must be held when using these:
++  enum procstate state;        // Process state
++  void *chan;                  // If non-zero, sleeping on chan
++  int killed;                  // If non-zero, have been killed
++  int xstate;                  // Exit status to be returned to parent's wait
++  int pid;                     // Process ID
++
++  // wait_lock must be held when using this:
++  struct proc *parent;         // Parent process
++
++  // these are private to the process, so p->lock need not be held.
++  uint64 kstack;               // Virtual address of kernel stack
++  uint64 sz;                   // Size of process memory (bytes)
++  pagetable_t pagetable;       // User page table
++  struct trapframe *trapframe; // data page for trampoline.S
++  struct context context;      // swtch() here to run process
++  struct file *ofile[NOFILE];  // Open files
++  struct inode *cwd;           // Current directory
++  char name[16];               // Process name (debugging)
++  
++  int alarm_interval;          // Alarm interval in ticks
++  void (*alarm_handler)();     // User alarm handler pointer
++  int alarm_ticks;             // Ticks elapsed since last alarm
++  int alarm_is_running;        // Is the alarm handler currently running?
++  struct trapframe *alarm_tf_copy; // Copy of trapframe to restore state
++};
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 1691faf..ba77888 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -1,366 +1,374 @@
+-// which hart (core) is this?
+-static inline uint64
+-r_mhartid()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, mhartid" : "=r" (x) );
+-  return x;
+-}
+-
+-// Machine Status Register, mstatus
+-
+-#define MSTATUS_MPP_MASK (3L << 11) // previous mode.
+-#define MSTATUS_MPP_M (3L << 11)
+-#define MSTATUS_MPP_S (1L << 11)
+-#define MSTATUS_MPP_U (0L << 11)
+-#define MSTATUS_MIE (1L << 3)    // machine-mode interrupt enable.
+-
+-static inline uint64
+-r_mstatus()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, mstatus" : "=r" (x) );
+-  return x;
+-}
+-
+-static inline void 
+-w_mstatus(uint64 x)
+-{
+-  asm volatile("csrw mstatus, %0" : : "r" (x));
+-}
+-
+-// machine exception program counter, holds the
+-// instruction address to which a return from
+-// exception will go.
+-static inline void 
+-w_mepc(uint64 x)
+-{
+-  asm volatile("csrw mepc, %0" : : "r" (x));
+-}
+-
+-// Supervisor Status Register, sstatus
+-
+-#define SSTATUS_SPP (1L << 8)  // Previous mode, 1=Supervisor, 0=User
+-#define SSTATUS_SPIE (1L << 5) // Supervisor Previous Interrupt Enable
+-#define SSTATUS_UPIE (1L << 4) // User Previous Interrupt Enable
+-#define SSTATUS_SIE (1L << 1)  // Supervisor Interrupt Enable
+-#define SSTATUS_UIE (1L << 0)  // User Interrupt Enable
+-
+-static inline uint64
+-r_sstatus()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, sstatus" : "=r" (x) );
+-  return x;
+-}
+-
+-static inline void 
+-w_sstatus(uint64 x)
+-{
+-  asm volatile("csrw sstatus, %0" : : "r" (x));
+-}
+-
+-// Supervisor Interrupt Pending
+-static inline uint64
+-r_sip()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, sip" : "=r" (x) );
+-  return x;
+-}
+-
+-static inline void 
+-w_sip(uint64 x)
+-{
+-  asm volatile("csrw sip, %0" : : "r" (x));
+-}
+-
+-// Supervisor Interrupt Enable
+-#define SIE_SEIE (1L << 9) // external
+-#define SIE_STIE (1L << 5) // timer
+-#define SIE_SSIE (1L << 1) // software
+-static inline uint64
+-r_sie()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, sie" : "=r" (x) );
+-  return x;
+-}
+-
+-static inline void 
+-w_sie(uint64 x)
+-{
+-  asm volatile("csrw sie, %0" : : "r" (x));
+-}
+-
+-// Machine-mode Interrupt Enable
+-#define MIE_MEIE (1L << 11) // external
+-#define MIE_MTIE (1L << 7)  // timer
+-#define MIE_MSIE (1L << 3)  // software
+-static inline uint64
+-r_mie()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, mie" : "=r" (x) );
+-  return x;
+-}
+-
+-static inline void 
+-w_mie(uint64 x)
+-{
+-  asm volatile("csrw mie, %0" : : "r" (x));
+-}
+-
+-// supervisor exception program counter, holds the
+-// instruction address to which a return from
+-// exception will go.
+-static inline void 
+-w_sepc(uint64 x)
+-{
+-  asm volatile("csrw sepc, %0" : : "r" (x));
+-}
+-
+-static inline uint64
+-r_sepc()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, sepc" : "=r" (x) );
+-  return x;
+-}
+-
+-// Machine Exception Delegation
+-static inline uint64
+-r_medeleg()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, medeleg" : "=r" (x) );
+-  return x;
+-}
+-
+-static inline void 
+-w_medeleg(uint64 x)
+-{
+-  asm volatile("csrw medeleg, %0" : : "r" (x));
+-}
+-
+-// Machine Interrupt Delegation
+-static inline uint64
+-r_mideleg()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, mideleg" : "=r" (x) );
+-  return x;
+-}
+-
+-static inline void 
+-w_mideleg(uint64 x)
+-{
+-  asm volatile("csrw mideleg, %0" : : "r" (x));
+-}
+-
+-// Supervisor Trap-Vector Base Address
+-// low two bits are mode.
+-static inline void 
+-w_stvec(uint64 x)
+-{
+-  asm volatile("csrw stvec, %0" : : "r" (x));
+-}
+-
+-static inline uint64
+-r_stvec()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, stvec" : "=r" (x) );
+-  return x;
+-}
+-
+-// Machine-mode interrupt vector
+-static inline void 
+-w_mtvec(uint64 x)
+-{
+-  asm volatile("csrw mtvec, %0" : : "r" (x));
+-}
+-
+-static inline void
+-w_pmpcfg0(uint64 x)
+-{
+-  asm volatile("csrw pmpcfg0, %0" : : "r" (x));
+-}
+-
+-static inline void
+-w_pmpaddr0(uint64 x)
+-{
+-  asm volatile("csrw pmpaddr0, %0" : : "r" (x));
+-}
+-
+-// use riscv's sv39 page table scheme.
+-#define SATP_SV39 (8L << 60)
+-
+-#define MAKE_SATP(pagetable) (SATP_SV39 | (((uint64)pagetable) >> 12))
+-
+-// supervisor address translation and protection;
+-// holds the address of the page table.
+-static inline void 
+-w_satp(uint64 x)
+-{
+-  asm volatile("csrw satp, %0" : : "r" (x));
+-}
+-
+-static inline uint64
+-r_satp()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, satp" : "=r" (x) );
+-  return x;
+-}
+-
+-// Supervisor Scratch register, for early trap handler in trampoline.S.
+-static inline void 
+-w_sscratch(uint64 x)
+-{
+-  asm volatile("csrw sscratch, %0" : : "r" (x));
+-}
+-
+-static inline void 
+-w_mscratch(uint64 x)
+-{
+-  asm volatile("csrw mscratch, %0" : : "r" (x));
+-}
+-
+-// Supervisor Trap Cause
+-static inline uint64
+-r_scause()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, scause" : "=r" (x) );
+-  return x;
+-}
+-
+-// Supervisor Trap Value
+-static inline uint64
+-r_stval()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, stval" : "=r" (x) );
+-  return x;
+-}
+-
+-// Machine-mode Counter-Enable
+-static inline void 
+-w_mcounteren(uint64 x)
+-{
+-  asm volatile("csrw mcounteren, %0" : : "r" (x));
+-}
+-
+-static inline uint64
+-r_mcounteren()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, mcounteren" : "=r" (x) );
+-  return x;
+-}
+-
+-// machine-mode cycle counter
+-static inline uint64
+-r_time()
+-{
+-  uint64 x;
+-  asm volatile("csrr %0, time" : "=r" (x) );
+-  return x;
+-}
+-
+-// enable device interrupts
+-static inline void
+-intr_on()
+-{
+-  w_sstatus(r_sstatus() | SSTATUS_SIE);
+-}
+-
+-// disable device interrupts
+-static inline void
+-intr_off()
+-{
+-  w_sstatus(r_sstatus() & ~SSTATUS_SIE);
+-}
+-
+-// are device interrupts enabled?
+-static inline int
+-intr_get()
+-{
+-  uint64 x = r_sstatus();
+-  return (x & SSTATUS_SIE) != 0;
+-}
+-
+-static inline uint64
+-r_sp()
+-{
+-  uint64 x;
+-  asm volatile("mv %0, sp" : "=r" (x) );
+-  return x;
+-}
+-
+-// read and write tp, the thread pointer, which holds
+-// this core's hartid (core number), the index into cpus[].
+-static inline uint64
+-r_tp()
+-{
+-  uint64 x;
+-  asm volatile("mv %0, tp" : "=r" (x) );
+-  return x;
+-}
+-
+-static inline void 
+-w_tp(uint64 x)
+-{
+-  asm volatile("mv tp, %0" : : "r" (x));
+-}
+-
+-static inline uint64
+-r_ra()
+-{
+-  uint64 x;
+-  asm volatile("mv %0, ra" : "=r" (x) );
+-  return x;
+-}
+-
+-// flush the TLB.
+-static inline void
+-sfence_vma()
+-{
+-  // the zero, zero means flush all TLB entries.
+-  asm volatile("sfence.vma zero, zero");
+-}
+-
+-
+-#define PGSIZE 4096 // bytes per page
+-#define PGSHIFT 12  // bits of offset within a page
+-
+-#define PGROUNDUP(sz)  (((sz)+PGSIZE-1) & ~(PGSIZE-1))
+-#define PGROUNDDOWN(a) (((a)) & ~(PGSIZE-1))
+-
+-#define PTE_V (1L << 0) // valid
+-#define PTE_R (1L << 1)
+-#define PTE_W (1L << 2)
+-#define PTE_X (1L << 3)
+-#define PTE_U (1L << 4) // 1 -> user can access
+-
+-// shift a physical address to the right place for a PTE.
+-#define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+-
+-#define PTE2PA(pte) (((pte) >> 10) << 12)
+-
+-#define PTE_FLAGS(pte) ((pte) & 0x3FF)
+-
+-// extract the three 9-bit page table indices from a virtual address.
+-#define PXMASK          0x1FF // 9 bits
+-#define PXSHIFT(level)  (PGSHIFT+(9*(level)))
+-#define PX(level, va) ((((uint64) (va)) >> PXSHIFT(level)) & PXMASK)
+-
+-// one beyond the highest possible virtual address.
+-// MAXVA is actually one bit less than the max allowed by
+-// Sv39, to avoid having to sign-extend virtual addresses
+-// that have the high bit set.
+-#define MAXVA (1L << (9 + 9 + 9 + 12 - 1))
+-
+-typedef uint64 pte_t;
+-typedef uint64 *pagetable_t; // 512 PTEs
++// which hart (core) is this?
++static inline uint64
++r_mhartid()
++{
++  uint64 x;
++  asm volatile("csrr %0, mhartid" : "=r" (x) );
++  return x;
++}
++
++// Machine Status Register, mstatus
++
++#define MSTATUS_MPP_MASK (3L << 11) // previous mode.
++#define MSTATUS_MPP_M (3L << 11)
++#define MSTATUS_MPP_S (1L << 11)
++#define MSTATUS_MPP_U (0L << 11)
++#define MSTATUS_MIE (1L << 3)    // machine-mode interrupt enable.
++
++static inline uint64
++r_mstatus()
++{
++  uint64 x;
++  asm volatile("csrr %0, mstatus" : "=r" (x) );
++  return x;
++}
++
++static inline void 
++w_mstatus(uint64 x)
++{
++  asm volatile("csrw mstatus, %0" : : "r" (x));
++}
++
++// machine exception program counter, holds the
++// instruction address to which a return from
++// exception will go.
++static inline void 
++w_mepc(uint64 x)
++{
++  asm volatile("csrw mepc, %0" : : "r" (x));
++}
++
++// Supervisor Status Register, sstatus
++
++#define SSTATUS_SPP (1L << 8)  // Previous mode, 1=Supervisor, 0=User
++#define SSTATUS_SPIE (1L << 5) // Supervisor Previous Interrupt Enable
++#define SSTATUS_UPIE (1L << 4) // User Previous Interrupt Enable
++#define SSTATUS_SIE (1L << 1)  // Supervisor Interrupt Enable
++#define SSTATUS_UIE (1L << 0)  // User Interrupt Enable
++
++static inline uint64
++r_sstatus()
++{
++  uint64 x;
++  asm volatile("csrr %0, sstatus" : "=r" (x) );
++  return x;
++}
++
++static inline void 
++w_sstatus(uint64 x)
++{
++  asm volatile("csrw sstatus, %0" : : "r" (x));
++}
++
++// Supervisor Interrupt Pending
++static inline uint64
++r_sip()
++{
++  uint64 x;
++  asm volatile("csrr %0, sip" : "=r" (x) );
++  return x;
++}
++
++static inline void 
++w_sip(uint64 x)
++{
++  asm volatile("csrw sip, %0" : : "r" (x));
++}
++
++// Supervisor Interrupt Enable
++#define SIE_SEIE (1L << 9) // external
++#define SIE_STIE (1L << 5) // timer
++#define SIE_SSIE (1L << 1) // software
++static inline uint64
++r_sie()
++{
++  uint64 x;
++  asm volatile("csrr %0, sie" : "=r" (x) );
++  return x;
++}
++
++static inline void 
++w_sie(uint64 x)
++{
++  asm volatile("csrw sie, %0" : : "r" (x));
++}
++
++// Machine-mode Interrupt Enable
++#define MIE_MEIE (1L << 11) // external
++#define MIE_MTIE (1L << 7)  // timer
++#define MIE_MSIE (1L << 3)  // software
++static inline uint64
++r_mie()
++{
++  uint64 x;
++  asm volatile("csrr %0, mie" : "=r" (x) );
++  return x;
++}
++
++static inline void 
++w_mie(uint64 x)
++{
++  asm volatile("csrw mie, %0" : : "r" (x));
++}
++
++// supervisor exception program counter, holds the
++// instruction address to which a return from
++// exception will go.
++static inline void 
++w_sepc(uint64 x)
++{
++  asm volatile("csrw sepc, %0" : : "r" (x));
++}
++
++static inline uint64
++r_sepc()
++{
++  uint64 x;
++  asm volatile("csrr %0, sepc" : "=r" (x) );
++  return x;
++}
++
++// Machine Exception Delegation
++static inline uint64
++r_medeleg()
++{
++  uint64 x;
++  asm volatile("csrr %0, medeleg" : "=r" (x) );
++  return x;
++}
++
++static inline void 
++w_medeleg(uint64 x)
++{
++  asm volatile("csrw medeleg, %0" : : "r" (x));
++}
++
++// Machine Interrupt Delegation
++static inline uint64
++r_mideleg()
++{
++  uint64 x;
++  asm volatile("csrr %0, mideleg" : "=r" (x) );
++  return x;
++}
++
++static inline void 
++w_mideleg(uint64 x)
++{
++  asm volatile("csrw mideleg, %0" : : "r" (x));
++}
++
++// Supervisor Trap-Vector Base Address
++// low two bits are mode.
++static inline void 
++w_stvec(uint64 x)
++{
++  asm volatile("csrw stvec, %0" : : "r" (x));
++}
++
++static inline uint64
++r_stvec()
++{
++  uint64 x;
++  asm volatile("csrr %0, stvec" : "=r" (x) );
++  return x;
++}
++
++// Machine-mode interrupt vector
++static inline void 
++w_mtvec(uint64 x)
++{
++  asm volatile("csrw mtvec, %0" : : "r" (x));
++}
++
++static inline void
++w_pmpcfg0(uint64 x)
++{
++  asm volatile("csrw pmpcfg0, %0" : : "r" (x));
++}
++
++static inline void
++w_pmpaddr0(uint64 x)
++{
++  asm volatile("csrw pmpaddr0, %0" : : "r" (x));
++}
++
++// use riscv's sv39 page table scheme.
++#define SATP_SV39 (8L << 60)
++
++#define MAKE_SATP(pagetable) (SATP_SV39 | (((uint64)pagetable) >> 12))
++
++// supervisor address translation and protection;
++// holds the address of the page table.
++static inline void 
++w_satp(uint64 x)
++{
++  asm volatile("csrw satp, %0" : : "r" (x));
++}
++
++static inline uint64
++r_satp()
++{
++  uint64 x;
++  asm volatile("csrr %0, satp" : "=r" (x) );
++  return x;
++}
++
++// Supervisor Scratch register, for early trap handler in trampoline.S.
++static inline void 
++w_sscratch(uint64 x)
++{
++  asm volatile("csrw sscratch, %0" : : "r" (x));
++}
++
++static inline void 
++w_mscratch(uint64 x)
++{
++  asm volatile("csrw mscratch, %0" : : "r" (x));
++}
++
++// Supervisor Trap Cause
++static inline uint64
++r_scause()
++{
++  uint64 x;
++  asm volatile("csrr %0, scause" : "=r" (x) );
++  return x;
++}
++
++// Supervisor Trap Value
++static inline uint64
++r_stval()
++{
++  uint64 x;
++  asm volatile("csrr %0, stval" : "=r" (x) );
++  return x;
++}
++
++// Machine-mode Counter-Enable
++static inline void 
++w_mcounteren(uint64 x)
++{
++  asm volatile("csrw mcounteren, %0" : : "r" (x));
++}
++
++static inline uint64
++r_mcounteren()
++{
++  uint64 x;
++  asm volatile("csrr %0, mcounteren" : "=r" (x) );
++  return x;
++}
++
++// machine-mode cycle counter
++static inline uint64
++r_time()
++{
++  uint64 x;
++  asm volatile("csrr %0, time" : "=r" (x) );
++  return x;
++}
++
++// enable device interrupts
++static inline void
++intr_on()
++{
++  w_sstatus(r_sstatus() | SSTATUS_SIE);
++}
++
++// disable device interrupts
++static inline void
++intr_off()
++{
++  w_sstatus(r_sstatus() & ~SSTATUS_SIE);
++}
++
++// are device interrupts enabled?
++static inline int
++intr_get()
++{
++  uint64 x = r_sstatus();
++  return (x & SSTATUS_SIE) != 0;
++}
++
++static inline uint64
++r_sp()
++{
++  uint64 x;
++  asm volatile("mv %0, sp" : "=r" (x) );
++  return x;
++}
++
++// read and write tp, the thread pointer, which holds
++// this core's hartid (core number), the index into cpus[].
++static inline uint64
++r_tp()
++{
++  uint64 x;
++  asm volatile("mv %0, tp" : "=r" (x) );
++  return x;
++}
++
++static inline void 
++w_tp(uint64 x)
++{
++  asm volatile("mv tp, %0" : : "r" (x));
++}
++
++static inline uint64
++r_ra()
++{
++  uint64 x;
++  asm volatile("mv %0, ra" : "=r" (x) );
++  return x;
++}
++
++static inline uint64
++r_fp()
++{
++  uint64 x;
++  asm volatile("mv %0, s0" : "=r" (x) );
++  return x;
++}
++
++// flush the TLB.
++static inline void
++sfence_vma()
++{
++  // the zero, zero means flush all TLB entries.
++  asm volatile("sfence.vma zero, zero");
++}
++
++
++#define PGSIZE 4096 // bytes per page
++#define PGSHIFT 12  // bits of offset within a page
++
++#define PGROUNDUP(sz)  (((sz)+PGSIZE-1) & ~(PGSIZE-1))
++#define PGROUNDDOWN(a) (((a)) & ~(PGSIZE-1))
++
++#define PTE_V (1L << 0) // valid
++#define PTE_R (1L << 1)
++#define PTE_W (1L << 2)
++#define PTE_X (1L << 3)
++#define PTE_U (1L << 4) // 1 -> user can access
++
++// shift a physical address to the right place for a PTE.
++#define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
++
++#define PTE2PA(pte) (((pte) >> 10) << 12)
++
++#define PTE_FLAGS(pte) ((pte) & 0x3FF)
++
++// extract the three 9-bit page table indices from a virtual address.
++#define PXMASK          0x1FF // 9 bits
++#define PXSHIFT(level)  (PGSHIFT+(9*(level)))
++#define PX(level, va) ((((uint64) (va)) >> PXSHIFT(level)) & PXMASK)
++
++// one beyond the highest possible virtual address.
++// MAXVA is actually one bit less than the max allowed by
++// Sv39, to avoid having to sign-extend virtual addresses
++// that have the high bit set.
++#define MAXVA (1L << (9 + 9 + 9 + 12 - 1))
++
++typedef uint64 pte_t;
++typedef uint64 *pagetable_t; // 512 PTEs
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..b9a6338 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -1,146 +1,150 @@
+-#include "types.h"
+-#include "param.h"
+-#include "memlayout.h"
+-#include "riscv.h"
+-#include "spinlock.h"
+-#include "proc.h"
+-#include "syscall.h"
+-#include "defs.h"
+-
+-// Fetch the uint64 at addr from the current process.
+-int
+-fetchaddr(uint64 addr, uint64 *ip)
+-{
+-  struct proc *p = myproc();
+-  if(addr >= p->sz || addr+sizeof(uint64) > p->sz)
+-    return -1;
+-  if(copyin(p->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
+-    return -1;
+-  return 0;
+-}
+-
+-// Fetch the nul-terminated string at addr from the current process.
+-// Returns length of string, not including nul, or -1 for error.
+-int
+-fetchstr(uint64 addr, char *buf, int max)
+-{
+-  struct proc *p = myproc();
+-  int err = copyinstr(p->pagetable, buf, addr, max);
+-  if(err < 0)
+-    return err;
+-  return strlen(buf);
+-}
+-
+-static uint64
+-argraw(int n)
+-{
+-  struct proc *p = myproc();
+-  switch (n) {
+-  case 0:
+-    return p->trapframe->a0;
+-  case 1:
+-    return p->trapframe->a1;
+-  case 2:
+-    return p->trapframe->a2;
+-  case 3:
+-    return p->trapframe->a3;
+-  case 4:
+-    return p->trapframe->a4;
+-  case 5:
+-    return p->trapframe->a5;
+-  }
+-  panic("argraw");
+-  return -1;
+-}
+-
+-// Fetch the nth 32-bit system call argument.
+-int
+-argint(int n, int *ip)
+-{
+-  *ip = argraw(n);
+-  return 0;
+-}
+-
+-// Retrieve an argument as a pointer.
+-// Doesn't check for legality, since
+-// copyin/copyout will do that.
+-int
+-argaddr(int n, uint64 *ip)
+-{
+-  *ip = argraw(n);
+-  return 0;
+-}
+-
+-// Fetch the nth word-sized system call argument as a null-terminated string.
+-// Copies into buf, at most max.
+-// Returns string length if OK (including nul), -1 if error.
+-int
+-argstr(int n, char *buf, int max)
+-{
+-  uint64 addr;
+-  if(argaddr(n, &addr) < 0)
+-    return -1;
+-  return fetchstr(addr, buf, max);
+-}
+-
+-extern uint64 sys_chdir(void);
+-extern uint64 sys_close(void);
+-extern uint64 sys_dup(void);
+-extern uint64 sys_exec(void);
+-extern uint64 sys_exit(void);
+-extern uint64 sys_fork(void);
+-extern uint64 sys_fstat(void);
+-extern uint64 sys_getpid(void);
+-extern uint64 sys_kill(void);
+-extern uint64 sys_link(void);
+-extern uint64 sys_mkdir(void);
+-extern uint64 sys_mknod(void);
+-extern uint64 sys_open(void);
+-extern uint64 sys_pipe(void);
+-extern uint64 sys_read(void);
+-extern uint64 sys_sbrk(void);
+-extern uint64 sys_sleep(void);
+-extern uint64 sys_unlink(void);
+-extern uint64 sys_wait(void);
+-extern uint64 sys_write(void);
+-extern uint64 sys_uptime(void);
+-
+-static uint64 (*syscalls[])(void) = {
+-[SYS_fork]    sys_fork,
+-[SYS_exit]    sys_exit,
+-[SYS_wait]    sys_wait,
+-[SYS_pipe]    sys_pipe,
+-[SYS_read]    sys_read,
+-[SYS_kill]    sys_kill,
+-[SYS_exec]    sys_exec,
+-[SYS_fstat]   sys_fstat,
+-[SYS_chdir]   sys_chdir,
+-[SYS_dup]     sys_dup,
+-[SYS_getpid]  sys_getpid,
+-[SYS_sbrk]    sys_sbrk,
+-[SYS_sleep]   sys_sleep,
+-[SYS_uptime]  sys_uptime,
+-[SYS_open]    sys_open,
+-[SYS_write]   sys_write,
+-[SYS_mknod]   sys_mknod,
+-[SYS_unlink]  sys_unlink,
+-[SYS_link]    sys_link,
+-[SYS_mkdir]   sys_mkdir,
+-[SYS_close]   sys_close,
+-};
+-
+-void
+-syscall(void)
+-{
+-  int num;
+-  struct proc *p = myproc();
+-
+-  num = p->trapframe->a7;
+-  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+-    p->trapframe->a0 = syscalls[num]();
+-  } else {
+-    printf("%d %s: unknown sys call %d\n",
+-            p->pid, p->name, num);
+-    p->trapframe->a0 = -1;
+-  }
+-}
++#include "types.h"
++#include "param.h"
++#include "memlayout.h"
++#include "riscv.h"
++#include "spinlock.h"
++#include "proc.h"
++#include "syscall.h"
++#include "defs.h"
++
++// Fetch the uint64 at addr from the current process.
++int
++fetchaddr(uint64 addr, uint64 *ip)
++{
++  struct proc *p = myproc();
++  if(addr >= p->sz || addr+sizeof(uint64) > p->sz)
++    return -1;
++  if(copyin(p->pagetable, (char *)ip, addr, sizeof(*ip)) != 0)
++    return -1;
++  return 0;
++}
++
++// Fetch the nul-terminated string at addr from the current process.
++// Returns length of string, not including nul, or -1 for error.
++int
++fetchstr(uint64 addr, char *buf, int max)
++{
++  struct proc *p = myproc();
++  int err = copyinstr(p->pagetable, buf, addr, max);
++  if(err < 0)
++    return err;
++  return strlen(buf);
++}
++
++static uint64
++argraw(int n)
++{
++  struct proc *p = myproc();
++  switch (n) {
++  case 0:
++    return p->trapframe->a0;
++  case 1:
++    return p->trapframe->a1;
++  case 2:
++    return p->trapframe->a2;
++  case 3:
++    return p->trapframe->a3;
++  case 4:
++    return p->trapframe->a4;
++  case 5:
++    return p->trapframe->a5;
++  }
++  panic("argraw");
++  return -1;
++}
++
++// Fetch the nth 32-bit system call argument.
++int
++argint(int n, int *ip)
++{
++  *ip = argraw(n);
++  return 0;
++}
++
++// Retrieve an argument as a pointer.
++// Doesn't check for legality, since
++// copyin/copyout will do that.
++int
++argaddr(int n, uint64 *ip)
++{
++  *ip = argraw(n);
++  return 0;
++}
++
++// Fetch the nth word-sized system call argument as a null-terminated string.
++// Copies into buf, at most max.
++// Returns string length if OK (including nul), -1 if error.
++int
++argstr(int n, char *buf, int max)
++{
++  uint64 addr;
++  if(argaddr(n, &addr) < 0)
++    return -1;
++  return fetchstr(addr, buf, max);
++}
++
++extern uint64 sys_chdir(void);
++extern uint64 sys_close(void);
++extern uint64 sys_dup(void);
++extern uint64 sys_exec(void);
++extern uint64 sys_exit(void);
++extern uint64 sys_fork(void);
++extern uint64 sys_fstat(void);
++extern uint64 sys_getpid(void);
++extern uint64 sys_kill(void);
++extern uint64 sys_link(void);
++extern uint64 sys_mkdir(void);
++extern uint64 sys_mknod(void);
++extern uint64 sys_open(void);
++extern uint64 sys_pipe(void);
++extern uint64 sys_read(void);
++extern uint64 sys_sbrk(void);
++extern uint64 sys_sleep(void);
++extern uint64 sys_unlink(void);
++extern uint64 sys_wait(void);
++extern uint64 sys_write(void);
++extern uint64 sys_uptime(void);
++extern uint64 sys_sigalarm(void);
++extern uint64 sys_sigreturn(void);
++
++static uint64 (*syscalls[])(void) = {
++[SYS_fork]    sys_fork,
++[SYS_exit]    sys_exit,
++[SYS_wait]    sys_wait,
++[SYS_pipe]    sys_pipe,
++[SYS_read]    sys_read,
++[SYS_kill]    sys_kill,
++[SYS_exec]    sys_exec,
++[SYS_fstat]   sys_fstat,
++[SYS_chdir]   sys_chdir,
++[SYS_dup]     sys_dup,
++[SYS_getpid]  sys_getpid,
++[SYS_sbrk]    sys_sbrk,
++[SYS_sleep]   sys_sleep,
++[SYS_uptime]  sys_uptime,
++[SYS_open]    sys_open,
++[SYS_write]   sys_write,
++[SYS_mknod]   sys_mknod,
++[SYS_unlink]  sys_unlink,
++[SYS_link]    sys_link,
++[SYS_mkdir]   sys_mkdir,
++[SYS_close]   sys_close,
++[SYS_sigalarm]  sys_sigalarm,
++[SYS_sigreturn] sys_sigreturn,
++};
++
++void
++syscall(void)
++{
++  int num;
++  struct proc *p = myproc();
++
++  num = p->trapframe->a7;
++  if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
++    p->trapframe->a0 = syscalls[num]();
++  } else {
++    printf("%d %s: unknown sys call %d\n",
++            p->pid, p->name, num);
++    p->trapframe->a0 = -1;
++  }
++}
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..60a68f5 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -1,22 +1,25 @@
+-// System call numbers
+-#define SYS_fork    1
+-#define SYS_exit    2
+-#define SYS_wait    3
+-#define SYS_pipe    4
+-#define SYS_read    5
+-#define SYS_kill    6
+-#define SYS_exec    7
+-#define SYS_fstat   8
+-#define SYS_chdir   9
+-#define SYS_dup    10
+-#define SYS_getpid 11
+-#define SYS_sbrk   12
+-#define SYS_sleep  13
+-#define SYS_uptime 14
+-#define SYS_open   15
+-#define SYS_write  16
+-#define SYS_mknod  17
+-#define SYS_unlink 18
+-#define SYS_link   19
+-#define SYS_mkdir  20
+-#define SYS_close  21
++// System call numbers
++#define SYS_fork    1
++#define SYS_exit    2
++#define SYS_wait    3
++#define SYS_pipe    4
++#define SYS_read    5
++#define SYS_kill    6
++#define SYS_exec    7
++#define SYS_fstat   8
++#define SYS_chdir   9
++#define SYS_dup    10
++#define SYS_getpid 11
++#define SYS_sbrk   12
++#define SYS_sleep  13
++#define SYS_uptime 14
++#define SYS_open   15
++#define SYS_write  16
++#define SYS_mknod  17
++#define SYS_unlink 18
++#define SYS_link   19
++#define SYS_mkdir  20
++#define SYS_close  21
++#define SYS_sigalarm  22
++#define SYS_sigreturn 23
++
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index e8bcda9..32a77b2 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -1,97 +1,124 @@
+-#include "types.h"
+-#include "riscv.h"
+-#include "defs.h"
+-#include "date.h"
+-#include "param.h"
+-#include "memlayout.h"
+-#include "spinlock.h"
+-#include "proc.h"
+-
+-uint64
+-sys_exit(void)
+-{
+-  int n;
+-  if(argint(0, &n) < 0)
+-    return -1;
+-  exit(n);
+-  return 0;  // not reached
+-}
+-
+-uint64
+-sys_getpid(void)
+-{
+-  return myproc()->pid;
+-}
+-
+-uint64
+-sys_fork(void)
+-{
+-  return fork();
+-}
+-
+-uint64
+-sys_wait(void)
+-{
+-  uint64 p;
+-  if(argaddr(0, &p) < 0)
+-    return -1;
+-  return wait(p);
+-}
+-
+-uint64
+-sys_sbrk(void)
+-{
+-  int addr;
+-  int n;
+-
+-  if(argint(0, &n) < 0)
+-    return -1;
+-  addr = myproc()->sz;
+-  if(growproc(n) < 0)
+-    return -1;
+-  return addr;
+-}
+-
+-uint64
+-sys_sleep(void)
+-{
+-  int n;
+-  uint ticks0;
+-
+-  if(argint(0, &n) < 0)
+-    return -1;
+-  acquire(&tickslock);
+-  ticks0 = ticks;
+-  while(ticks - ticks0 < n){
+-    if(myproc()->killed){
+-      release(&tickslock);
+-      return -1;
+-    }
+-    sleep(&ticks, &tickslock);
+-  }
+-  release(&tickslock);
+-  return 0;
+-}
+-
+-uint64
+-sys_kill(void)
+-{
+-  int pid;
+-
+-  if(argint(0, &pid) < 0)
+-    return -1;
+-  return kill(pid);
+-}
+-
+-// return how many clock tick interrupts have occurred
+-// since start.
+-uint64
+-sys_uptime(void)
+-{
+-  uint xticks;
+-
+-  acquire(&tickslock);
+-  xticks = ticks;
+-  release(&tickslock);
+-  return xticks;
+-}
++#include "types.h"
++#include "riscv.h"
++#include "defs.h"
++#include "date.h"
++#include "param.h"
++#include "memlayout.h"
++#include "spinlock.h"
++#include "proc.h"
++
++uint64
++sys_exit(void)
++{
++  int n;
++  if(argint(0, &n) < 0)
++    return -1;
++  exit(n);
++  return 0;  // not reached
++}
++
++uint64
++sys_getpid(void)
++{
++  return myproc()->pid;
++}
++
++uint64
++sys_fork(void)
++{
++  return fork();
++}
++
++uint64
++sys_wait(void)
++{
++  uint64 p;
++  if(argaddr(0, &p) < 0)
++    return -1;
++  return wait(p);
++}
++
++uint64
++sys_sbrk(void)
++{
++  int addr;
++  int n;
++
++  if(argint(0, &n) < 0)
++    return -1;
++  addr = myproc()->sz;
++  if(growproc(n) < 0)
++    return -1;
++  return addr;
++}
++
++uint64
++sys_sleep(void)
++{
++  int n;
++  uint ticks0;
++
++  if(argint(0, &n) < 0)
++    return -1;
++  backtrace();
++  acquire(&tickslock);
++  ticks0 = ticks;
++  while(ticks - ticks0 < n){
++    if(myproc()->killed){
++      release(&tickslock);
++      return -1;
++    }
++    sleep(&ticks, &tickslock);
++  }
++  release(&tickslock);
++  return 0;
++}
++
++uint64
++sys_kill(void)
++{
++  int pid;
++
++  if(argint(0, &pid) < 0)
++    return -1;
++  return kill(pid);
++}
++
++// return how many clock tick interrupts have occurred
++// since start.
++uint64
++sys_uptime(void)
++{
++  uint xticks;
++
++  acquire(&tickslock);
++  xticks = ticks;
++  release(&tickslock);
++  return xticks;
++}
++
++uint64
++sys_sigalarm(void)
++{
++  int ticks;
++  uint64 handler;
++
++  if(argint(0, &ticks) < 0 || argaddr(1, &handler) < 0)
++    return -1;
++
++  struct proc *p = myproc();
++  p->alarm_interval = ticks;
++  p->alarm_handler = (void(*)())handler;
++  p->alarm_ticks = 0;
++
++  return 0;
++}
++
++uint64
++sys_sigreturn(void)
++{
++  struct proc *p = myproc();
++  *p->trapframe = *p->alarm_tf_copy;
++  p->alarm_is_running = 0;
++  return p->trapframe->a0;
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..f8eef3c 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -77,8 +77,20 @@ usertrap(void)
+     exit(-1);
+ 
+   // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
++  if(which_dev == 2) {
++    if(p->alarm_interval > 0) {
++      p->alarm_ticks++;
++      if(p->alarm_ticks == p->alarm_interval) {
++        p->alarm_ticks = 0;
++        if(p->alarm_is_running == 0) {
++          p->alarm_is_running = 1;
++          *p->alarm_tf_copy = *p->trapframe;
++          p->trapframe->epc = (uint64)p->alarm_handler;
++        }
++      }
++    }
+     yield();
++  }
+ 
+   usertrapret();
+ }
+diff --git a/kernel/vm.c b/kernel/vm.c
+index d5a12a0..dd292fa 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -1,434 +1,434 @@
+-#include "param.h"
+-#include "types.h"
+-#include "memlayout.h"
+-#include "elf.h"
+-#include "riscv.h"
+-#include "defs.h"
+-#include "fs.h"
+-
+-/*
+- * the kernel's page table.
+- */
+-pagetable_t kernel_pagetable;
+-
+-extern char etext[];  // kernel.ld sets this to end of kernel code.
+-
+-extern char trampoline[]; // trampoline.S
+-
+-// Make a direct-map page table for the kernel.
+-pagetable_t
+-kvmmake(void)
+-{
+-  pagetable_t kpgtbl;
+-
+-  kpgtbl = (pagetable_t) kalloc();
+-  memset(kpgtbl, 0, PGSIZE);
+-
+-  // uart registers
+-  kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
+-
+-  // virtio mmio disk interface
+-  kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
+-
+-  // PLIC
+-  kvmmap(kpgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
+-
+-  // map kernel text executable and read-only.
+-  kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
+-
+-  // map kernel data and the physical RAM we'll make use of.
+-  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
+-
+-  // map the trampoline for trap entry/exit to
+-  // the highest virtual address in the kernel.
+-  kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
+-
+-  // map kernel stacks
+-  proc_mapstacks(kpgtbl);
+-  
+-  return kpgtbl;
+-}
+-
+-// Initialize the one kernel_pagetable
+-void
+-kvminit(void)
+-{
+-  kernel_pagetable = kvmmake();
+-}
+-
+-// Switch h/w page table register to the kernel's page table,
+-// and enable paging.
+-void
+-kvminithart()
+-{
+-  w_satp(MAKE_SATP(kernel_pagetable));
+-  sfence_vma();
+-}
+-
+-// Return the address of the PTE in page table pagetable
+-// that corresponds to virtual address va.  If alloc!=0,
+-// create any required page-table pages.
+-//
+-// The risc-v Sv39 scheme has three levels of page-table
+-// pages. A page-table page contains 512 64-bit PTEs.
+-// A 64-bit virtual address is split into five fields:
+-//   39..63 -- must be zero.
+-//   30..38 -- 9 bits of level-2 index.
+-//   21..29 -- 9 bits of level-1 index.
+-//   12..20 -- 9 bits of level-0 index.
+-//    0..11 -- 12 bits of byte offset within the page.
+-pte_t *
+-walk(pagetable_t pagetable, uint64 va, int alloc)
+-{
+-  if(va >= MAXVA)
+-    panic("walk");
+-
+-  for(int level = 2; level > 0; level--) {
+-    pte_t *pte = &pagetable[PX(level, va)];
+-    if(*pte & PTE_V) {
+-      pagetable = (pagetable_t)PTE2PA(*pte);
+-    } else {
+-      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
+-        return 0;
+-      memset(pagetable, 0, PGSIZE);
+-      *pte = PA2PTE(pagetable) | PTE_V;
+-    }
+-  }
+-  return &pagetable[PX(0, va)];
+-}
+-
+-// Look up a virtual address, return the physical address,
+-// or 0 if not mapped.
+-// Can only be used to look up user pages.
+-uint64
+-walkaddr(pagetable_t pagetable, uint64 va)
+-{
+-  pte_t *pte;
+-  uint64 pa;
+-
+-  if(va >= MAXVA)
+-    return 0;
+-
+-  pte = walk(pagetable, va, 0);
+-  if(pte == 0)
+-    return 0;
+-  if((*pte & PTE_V) == 0)
+-    return 0;
+-  if((*pte & PTE_U) == 0)
+-    return 0;
+-  pa = PTE2PA(*pte);
+-  return pa;
+-}
+-
+-// add a mapping to the kernel page table.
+-// only used when booting.
+-// does not flush TLB or enable paging.
+-void
+-kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+-{
+-  if(mappages(kpgtbl, va, sz, pa, perm) != 0)
+-    panic("kvmmap");
+-}
+-
+-// Create PTEs for virtual addresses starting at va that refer to
+-// physical addresses starting at pa. va and size might not
+-// be page-aligned. Returns 0 on success, -1 if walk() couldn't
+-// allocate a needed page-table page.
+-int
+-mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+-{
+-  uint64 a, last;
+-  pte_t *pte;
+-
+-  if(size == 0)
+-    panic("mappages: size");
+-  
+-  a = PGROUNDDOWN(va);
+-  last = PGROUNDDOWN(va + size - 1);
+-  for(;;){
+-    if((pte = walk(pagetable, a, 1)) == 0)
+-      return -1;
+-    if(*pte & PTE_V)
+-      panic("mappages: remap");
+-    *pte = PA2PTE(pa) | perm | PTE_V;
+-    if(a == last)
+-      break;
+-    a += PGSIZE;
+-    pa += PGSIZE;
+-  }
+-  return 0;
+-}
+-
+-// Remove npages of mappings starting from va. va must be
+-// page-aligned. The mappings must exist.
+-// Optionally free the physical memory.
+-void
+-uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+-{
+-  uint64 a;
+-  pte_t *pte;
+-
+-  if((va % PGSIZE) != 0)
+-    panic("uvmunmap: not aligned");
+-
+-  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+-    if((pte = walk(pagetable, a, 0)) == 0)
+-      panic("uvmunmap: walk");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmunmap: not mapped");
+-    if(PTE_FLAGS(*pte) == PTE_V)
+-      panic("uvmunmap: not a leaf");
+-    if(do_free){
+-      uint64 pa = PTE2PA(*pte);
+-      kfree((void*)pa);
+-    }
+-    *pte = 0;
+-  }
+-}
+-
+-// create an empty user page table.
+-// returns 0 if out of memory.
+-pagetable_t
+-uvmcreate()
+-{
+-  pagetable_t pagetable;
+-  pagetable = (pagetable_t) kalloc();
+-  if(pagetable == 0)
+-    return 0;
+-  memset(pagetable, 0, PGSIZE);
+-  return pagetable;
+-}
+-
+-// Load the user initcode into address 0 of pagetable,
+-// for the very first process.
+-// sz must be less than a page.
+-void
+-uvminit(pagetable_t pagetable, uchar *src, uint sz)
+-{
+-  char *mem;
+-
+-  if(sz >= PGSIZE)
+-    panic("inituvm: more than a page");
+-  mem = kalloc();
+-  memset(mem, 0, PGSIZE);
+-  mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
+-  memmove(mem, src, sz);
+-}
+-
+-// Allocate PTEs and physical memory to grow process from oldsz to
+-// newsz, which need not be page aligned.  Returns new size or 0 on error.
+-uint64
+-uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+-{
+-  char *mem;
+-  uint64 a;
+-
+-  if(newsz < oldsz)
+-    return oldsz;
+-
+-  oldsz = PGROUNDUP(oldsz);
+-  for(a = oldsz; a < newsz; a += PGSIZE){
+-    mem = kalloc();
+-    if(mem == 0){
+-      uvmdealloc(pagetable, a, oldsz);
+-      return 0;
+-    }
+-    memset(mem, 0, PGSIZE);
+-    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
+-      kfree(mem);
+-      uvmdealloc(pagetable, a, oldsz);
+-      return 0;
+-    }
+-  }
+-  return newsz;
+-}
+-
+-// Deallocate user pages to bring the process size from oldsz to
+-// newsz.  oldsz and newsz need not be page-aligned, nor does newsz
+-// need to be less than oldsz.  oldsz can be larger than the actual
+-// process size.  Returns the new process size.
+-uint64
+-uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+-{
+-  if(newsz >= oldsz)
+-    return oldsz;
+-
+-  if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
+-    int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
+-    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
+-  }
+-
+-  return newsz;
+-}
+-
+-// Recursively free page-table pages.
+-// All leaf mappings must already have been removed.
+-void
+-freewalk(pagetable_t pagetable)
+-{
+-  // there are 2^9 = 512 PTEs in a page table.
+-  for(int i = 0; i < 512; i++){
+-    pte_t pte = pagetable[i];
+-    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
+-      // this PTE points to a lower-level page table.
+-      uint64 child = PTE2PA(pte);
+-      freewalk((pagetable_t)child);
+-      pagetable[i] = 0;
+-    } else if(pte & PTE_V){
+-      panic("freewalk: leaf");
+-    }
+-  }
+-  kfree((void*)pagetable);
+-}
+-
+-// Free user memory pages,
+-// then free page-table pages.
+-void
+-uvmfree(pagetable_t pagetable, uint64 sz)
+-{
+-  if(sz > 0)
+-    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
+-  freewalk(pagetable);
+-}
+-
+-// Given a parent process's page table, copy
+-// its memory into a child's page table.
+-// Copies both the page table and the
+-// physical memory.
+-// returns 0 on success, -1 on failure.
+-// frees any allocated pages on failure.
+-int
+-uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+-{
+-  pte_t *pte;
+-  uint64 pa, i;
+-  uint flags;
+-  char *mem;
+-
+-  for(i = 0; i < sz; i += PGSIZE){
+-    if((pte = walk(old, i, 0)) == 0)
+-      panic("uvmcopy: pte should exist");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmcopy: page not present");
+-    pa = PTE2PA(*pte);
+-    flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
+-      goto err;
+-    }
+-  }
+-  return 0;
+-
+- err:
+-  uvmunmap(new, 0, i / PGSIZE, 1);
+-  return -1;
+-}
+-
+-// mark a PTE invalid for user access.
+-// used by exec for the user stack guard page.
+-void
+-uvmclear(pagetable_t pagetable, uint64 va)
+-{
+-  pte_t *pte;
+-  
+-  pte = walk(pagetable, va, 0);
+-  if(pte == 0)
+-    panic("uvmclear");
+-  *pte &= ~PTE_U;
+-}
+-
+-// Copy from kernel to user.
+-// Copy len bytes from src to virtual address dstva in a given page table.
+-// Return 0 on success, -1 on error.
+-int
+-copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+-{
+-  uint64 n, va0, pa0;
+-
+-  while(len > 0){
+-    va0 = PGROUNDDOWN(dstva);
+-    pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
+-      return -1;
+-    n = PGSIZE - (dstva - va0);
+-    if(n > len)
+-      n = len;
+-    memmove((void *)(pa0 + (dstva - va0)), src, n);
+-
+-    len -= n;
+-    src += n;
+-    dstva = va0 + PGSIZE;
+-  }
+-  return 0;
+-}
+-
+-// Copy from user to kernel.
+-// Copy len bytes to dst from virtual address srcva in a given page table.
+-// Return 0 on success, -1 on error.
+-int
+-copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+-{
+-  uint64 n, va0, pa0;
+-
+-  while(len > 0){
+-    va0 = PGROUNDDOWN(srcva);
+-    pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
+-      return -1;
+-    n = PGSIZE - (srcva - va0);
+-    if(n > len)
+-      n = len;
+-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+-
+-    len -= n;
+-    dst += n;
+-    srcva = va0 + PGSIZE;
+-  }
+-  return 0;
+-}
+-
+-// Copy a null-terminated string from user to kernel.
+-// Copy bytes to dst from virtual address srcva in a given page table,
+-// until a '\0', or max.
+-// Return 0 on success, -1 on error.
+-int
+-copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+-{
+-  uint64 n, va0, pa0;
+-  int got_null = 0;
+-
+-  while(got_null == 0 && max > 0){
+-    va0 = PGROUNDDOWN(srcva);
+-    pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
+-      return -1;
+-    n = PGSIZE - (srcva - va0);
+-    if(n > max)
+-      n = max;
+-
+-    char *p = (char *) (pa0 + (srcva - va0));
+-    while(n > 0){
+-      if(*p == '\0'){
+-        *dst = '\0';
+-        got_null = 1;
+-        break;
+-      } else {
+-        *dst = *p;
+-      }
+-      --n;
+-      --max;
+-      p++;
+-      dst++;
+-    }
+-
+-    srcva = va0 + PGSIZE;
+-  }
+-  if(got_null){
+-    return 0;
+-  } else {
+-    return -1;
+-  }
+-}
++#include "param.h"
++#include "types.h"
++#include "memlayout.h"
++#include "elf.h"
++#include "riscv.h"
++#include "defs.h"
++#include "fs.h"
++
++/*
++ * the kernel's page table.
++ */
++pagetable_t kernel_pagetable;
++
++extern char etext[];  // kernel.ld sets this to end of kernel code.
++
++extern char trampoline[]; // trampoline.S
++
++// Make a direct-map page table for the kernel.
++pagetable_t
++kvmmake(void)
++{
++  pagetable_t kpgtbl;
++
++  kpgtbl = (pagetable_t) kalloc();
++  memset(kpgtbl, 0, PGSIZE);
++
++  // uart registers
++  kvmmap(kpgtbl, UART0, UART0, PGSIZE, PTE_R | PTE_W);
++
++  // virtio mmio disk interface
++  kvmmap(kpgtbl, VIRTIO0, VIRTIO0, PGSIZE, PTE_R | PTE_W);
++
++  // PLIC
++  kvmmap(kpgtbl, PLIC, PLIC, 0x400000, PTE_R | PTE_W);
++
++  // map kernel text executable and read-only.
++  kvmmap(kpgtbl, KERNBASE, KERNBASE, (uint64)etext-KERNBASE, PTE_R | PTE_X);
++
++  // map kernel data and the physical RAM we'll make use of.
++  kvmmap(kpgtbl, (uint64)etext, (uint64)etext, PHYSTOP-(uint64)etext, PTE_R | PTE_W);
++
++  // map the trampoline for trap entry/exit to
++  // the highest virtual address in the kernel.
++  kvmmap(kpgtbl, TRAMPOLINE, (uint64)trampoline, PGSIZE, PTE_R | PTE_X);
++
++  // map kernel stacks
++  proc_mapstacks(kpgtbl);
++  
++  return kpgtbl;
++}
++
++// Initialize the one kernel_pagetable
++void
++kvminit(void)
++{
++  kernel_pagetable = kvmmake();
++}
++
++// Switch h/w page table register to the kernel's page table,
++// and enable paging.
++void
++kvminithart()
++{
++  w_satp(MAKE_SATP(kernel_pagetable));
++  sfence_vma();
++}
++
++// Return the address of the PTE in page table pagetable
++// that corresponds to virtual address va.  If alloc!=0,
++// create any required page-table pages.
++//
++// The risc-v Sv39 scheme has three levels of page-table
++// pages. A page-table page contains 512 64-bit PTEs.
++// A 64-bit virtual address is split into five fields:
++//   39..63 -- must be zero.
++//   30..38 -- 9 bits of level-2 index.
++//   21..29 -- 9 bits of level-1 index.
++//   12..20 -- 9 bits of level-0 index.
++//    0..11 -- 12 bits of byte offset within the page.
++pte_t *
++walk(pagetable_t pagetable, uint64 va, int alloc)
++{
++  if(va >= MAXVA)
++    panic("walk");
++
++  for(int level = 2; level > 0; level--) {
++    pte_t *pte = &pagetable[PX(level, va)];
++    if(*pte & PTE_V) {
++      pagetable = (pagetable_t)PTE2PA(*pte);
++    } else {
++      if(!alloc || (pagetable = (pde_t*)kalloc()) == 0)
++        return 0;
++      memset(pagetable, 0, PGSIZE);
++      *pte = PA2PTE(pagetable) | PTE_V;
++    }
++  }
++  return &pagetable[PX(0, va)];
++}
++
++// Look up a virtual address, return the physical address,
++// or 0 if not mapped.
++// Can only be used to look up user pages.
++uint64
++walkaddr(pagetable_t pagetable, uint64 va)
++{
++  pte_t *pte;
++  uint64 pa;
++
++  if(va >= MAXVA)
++    return 0;
++
++  pte = walk(pagetable, va, 0);
++  if(pte == 0)
++    return 0;
++  if((*pte & PTE_V) == 0)
++    return 0;
++  if((*pte & PTE_U) == 0)
++    return 0;
++  pa = PTE2PA(*pte);
++  return pa;
++}
++
++// add a mapping to the kernel page table.
++// only used when booting.
++// does not flush TLB or enable paging.
++void
++kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
++{
++  if(mappages(kpgtbl, va, sz, pa, perm) != 0)
++    panic("kvmmap");
++}
++
++// Create PTEs for virtual addresses starting at va that refer to
++// physical addresses starting at pa. va and size might not
++// be page-aligned. Returns 0 on success, -1 if walk() couldn't
++// allocate a needed page-table page.
++int
++mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
++{
++  uint64 a, last;
++  pte_t *pte;
++
++  if(size == 0)
++    panic("mappages: size");
++  
++  a = PGROUNDDOWN(va);
++  last = PGROUNDDOWN(va + size - 1);
++  for(;;){
++    if((pte = walk(pagetable, a, 1)) == 0)
++      return -1;
++    if(*pte & PTE_V)
++      panic("mappages: remap");
++    *pte = PA2PTE(pa) | perm | PTE_V;
++    if(a == last)
++      break;
++    a += PGSIZE;
++    pa += PGSIZE;
++  }
++  return 0;
++}
++
++// Remove npages of mappings starting from va. va must be
++// page-aligned. The mappings must exist.
++// Optionally free the physical memory.
++void
++uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
++{
++  uint64 a;
++  pte_t *pte;
++
++  if((va % PGSIZE) != 0)
++    panic("uvmunmap: not aligned");
++
++  for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
++    if((pte = walk(pagetable, a, 0)) == 0)
++      panic("uvmunmap: walk");
++    if((*pte & PTE_V) == 0)
++      panic("uvmunmap: not mapped");
++    if(PTE_FLAGS(*pte) == PTE_V)
++      panic("uvmunmap: not a leaf");
++    if(do_free){
++      uint64 pa = PTE2PA(*pte);
++      kfree((void*)pa);
++    }
++    *pte = 0;
++  }
++}
++
++// create an empty user page table.
++// returns 0 if out of memory.
++pagetable_t
++uvmcreate()
++{
++  pagetable_t pagetable;
++  pagetable = (pagetable_t) kalloc();
++  if(pagetable == 0)
++    return 0;
++  memset(pagetable, 0, PGSIZE);
++  return pagetable;
++}
++
++// Load the user initcode into address 0 of pagetable,
++// for the very first process.
++// sz must be less than a page.
++void
++uvminit(pagetable_t pagetable, uchar *src, uint sz)
++{
++  char *mem;
++
++  if(sz >= PGSIZE)
++    panic("inituvm: more than a page");
++  mem = kalloc();
++  memset(mem, 0, PGSIZE);
++  mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
++  memmove(mem, src, sz);
++}
++
++// Allocate PTEs and physical memory to grow process from oldsz to
++// newsz, which need not be page aligned.  Returns new size or 0 on error.
++uint64
++uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
++{
++  char *mem;
++  uint64 a;
++
++  if(newsz < oldsz)
++    return oldsz;
++
++  oldsz = PGROUNDUP(oldsz);
++  for(a = oldsz; a < newsz; a += PGSIZE){
++    mem = kalloc();
++    if(mem == 0){
++      uvmdealloc(pagetable, a, oldsz);
++      return 0;
++    }
++    memset(mem, 0, PGSIZE);
++    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
++      kfree(mem);
++      uvmdealloc(pagetable, a, oldsz);
++      return 0;
++    }
++  }
++  return newsz;
++}
++
++// Deallocate user pages to bring the process size from oldsz to
++// newsz.  oldsz and newsz need not be page-aligned, nor does newsz
++// need to be less than oldsz.  oldsz can be larger than the actual
++// process size.  Returns the new process size.
++uint64
++uvmdealloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
++{
++  if(newsz >= oldsz)
++    return oldsz;
++
++  if(PGROUNDUP(newsz) < PGROUNDUP(oldsz)){
++    int npages = (PGROUNDUP(oldsz) - PGROUNDUP(newsz)) / PGSIZE;
++    uvmunmap(pagetable, PGROUNDUP(newsz), npages, 1);
++  }
++
++  return newsz;
++}
++
++// Recursively free page-table pages.
++// All leaf mappings must already have been removed.
++void
++freewalk(pagetable_t pagetable)
++{
++  // there are 2^9 = 512 PTEs in a page table.
++  for(int i = 0; i < 512; i++){
++    pte_t pte = pagetable[i];
++    if((pte & PTE_V) && (pte & (PTE_R|PTE_W|PTE_X)) == 0){
++      // this PTE points to a lower-level page table.
++      uint64 child = PTE2PA(pte);
++      freewalk((pagetable_t)child);
++      pagetable[i] = 0;
++    } else if(pte & PTE_V){
++      panic("freewalk: leaf");
++    }
++  }
++  kfree((void*)pagetable);
++}
++
++// Free user memory pages,
++// then free page-table pages.
++void
++uvmfree(pagetable_t pagetable, uint64 sz)
++{
++  if(sz > 0)
++    uvmunmap(pagetable, 0, PGROUNDUP(sz)/PGSIZE, 1);
++  freewalk(pagetable);
++}
++
++// Given a parent process's page table, copy
++// its memory into a child's page table.
++// Copies both the page table and the
++// physical memory.
++// returns 0 on success, -1 on failure.
++// frees any allocated pages on failure.
++int
++uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
++{
++  pte_t *pte;
++  uint64 pa, i;
++  uint flags;
++  char *mem;
++
++  for(i = 0; i < sz; i += PGSIZE){
++    if((pte = walk(old, i, 0)) == 0)
++      panic("uvmcopy: pte should exist");
++    if((*pte & PTE_V) == 0)
++      panic("uvmcopy: page not present");
++    pa = PTE2PA(*pte);
++    flags = PTE_FLAGS(*pte);
++    if((mem = kalloc()) == 0)
++      goto err;
++    memmove(mem, (char*)pa, PGSIZE);
++    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
++      kfree(mem);
++      goto err;
++    }
++  }
++  return 0;
++
++ err:
++  uvmunmap(new, 0, i / PGSIZE, 1);
++  return -1;
++}
++
++// mark a PTE invalid for user access.
++// used by exec for the user stack guard page.
++void
++uvmclear(pagetable_t pagetable, uint64 va)
++{
++  pte_t *pte;
++  
++  pte = walk(pagetable, va, 0);
++  if(pte == 0)
++    panic("uvmclear");
++  *pte &= ~PTE_U;
++}
++
++// Copy from kernel to user.
++// Copy len bytes from src to virtual address dstva in a given page table.
++// Return 0 on success, -1 on error.
++int
++copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
++{
++  uint64 n, va0, pa0;
++
++  while(len > 0){
++    va0 = PGROUNDDOWN(dstva);
++    pa0 = walkaddr(pagetable, va0);
++    if(pa0 == 0)
++      return -1;
++    n = PGSIZE - (dstva - va0);
++    if(n > len)
++      n = len;
++    memmove((void *)(pa0 + (dstva - va0)), src, n);
++
++    len -= n;
++    src += n;
++    dstva = va0 + PGSIZE;
++  }
++  return 0;
++}
++
++// Copy from user to kernel.
++// Copy len bytes to dst from virtual address srcva in a given page table.
++// Return 0 on success, -1 on error.
++int
++copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
++{
++  uint64 n, va0, pa0;
++
++  while(len > 0){
++    va0 = PGROUNDDOWN(srcva);
++    pa0 = walkaddr(pagetable, va0);
++    if(pa0 == 0)
++      return -1;
++    n = PGSIZE - (srcva - va0);
++    if(n > len)
++      n = len;
++    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
++
++    len -= n;
++    dst += n;
++    srcva = va0 + PGSIZE;
++  }
++  return 0;
++}
++
++// Copy a null-terminated string from user to kernel.
++// Copy bytes to dst from virtual address srcva in a given page table,
++// until a '\0', or max.
++// Return 0 on success, -1 on error.
++int
++copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
++{
++  uint64 n, va0, pa0;
++  int got_null = 0;
++
++  while(got_null == 0 && max > 0){
++    va0 = PGROUNDDOWN(srcva);
++    pa0 = walkaddr(pagetable, va0);
++    if(pa0 == 0)
++      return -1;
++    n = PGSIZE - (srcva - va0);
++    if(n > max)
++      n = max;
++
++    char *p = (char *) (pa0 + (srcva - va0));
++    while(n > 0){
++      if(*p == '\0'){
++        *dst = '\0';
++        got_null = 1;
++        break;
++      } else {
++        *dst = *p;
++      }
++      --n;
++      --max;
++      p++;
++      dst++;
++    }
++
++    srcva = va0 + PGSIZE;
++  }
++  if(got_null){
++    return 0;
++  } else {
++    return -1;
++  }
++}
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..7ed6ff8
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++5
+diff --git a/user/alarmtest.c b/user/alarmtest.c
+index 38f09ff..f8c0ac7 100644
+--- a/user/alarmtest.c
++++ b/user/alarmtest.c
+@@ -1,157 +1,157 @@
+-//
+-// test program for the alarm lab.
+-// you can modify this file for testing,
+-// but please make sure your kernel
+-// modifications pass the original
+-// versions of these tests.
+-//
+-
+-#include "kernel/param.h"
+-#include "kernel/types.h"
+-#include "kernel/stat.h"
+-#include "kernel/riscv.h"
+-#include "user/user.h"
+-
+-void test0();
+-void test1();
+-void test2();
+-void periodic();
+-void slow_handler();
+-
+-int
+-main(int argc, char *argv[])
+-{
+-  test0();
+-  test1();
+-  test2();
+-  exit(0);
+-}
+-
+-volatile static int count;
+-
+-void
+-periodic()
+-{
+-  count = count + 1;
+-  printf("alarm!\n");
+-  sigreturn();
+-}
+-
+-// tests whether the kernel calls
+-// the alarm handler even a single time.
+-void
+-test0()
+-{
+-  int i;
+-  printf("test0 start\n");
+-  count = 0;
+-  sigalarm(2, periodic);
+-  for(i = 0; i < 1000*500000; i++){
+-    if((i % 1000000) == 0)
+-      write(2, ".", 1);
+-    if(count > 0)
+-      break;
+-  }
+-  sigalarm(0, 0);
+-  if(count > 0){
+-    printf("test0 passed\n");
+-  } else {
+-    printf("\ntest0 failed: the kernel never called the alarm handler\n");
+-  }
+-}
+-
+-void __attribute__ ((noinline)) foo(int i, int *j) {
+-  if((i % 2500000) == 0) {
+-    write(2, ".", 1);
+-  }
+-  *j += 1;
+-}
+-
+-//
+-// tests that the kernel calls the handler multiple times.
+-//
+-// tests that, when the handler returns, it returns to
+-// the point in the program where the timer interrupt
+-// occurred, with all registers holding the same values they
+-// held when the interrupt occurred.
+-//
+-void
+-test1()
+-{
+-  int i;
+-  int j;
+-
+-  printf("test1 start\n");
+-  count = 0;
+-  j = 0;
+-  sigalarm(2, periodic);
+-  for(i = 0; i < 500000000; i++){
+-    if(count >= 10)
+-      break;
+-    foo(i, &j);
+-  }
+-  if(count < 10){
+-    printf("\ntest1 failed: too few calls to the handler\n");
+-  } else if(i != j){
+-    // the loop should have called foo() i times, and foo() should
+-    // have incremented j once per call, so j should equal i.
+-    // once possible source of errors is that the handler may
+-    // return somewhere other than where the timer interrupt
+-    // occurred; another is that that registers may not be
+-    // restored correctly, causing i or j or the address ofj
+-    // to get an incorrect value.
+-    printf("\ntest1 failed: foo() executed fewer times than it was called\n");
+-  } else {
+-    printf("test1 passed\n");
+-  }
+-}
+-
+-//
+-// tests that kernel does not allow reentrant alarm calls.
+-void
+-test2()
+-{
+-  int i;
+-  int pid;
+-  int status;
+-
+-  printf("test2 start\n");
+-  if ((pid = fork()) < 0) {
+-    printf("test2: fork failed\n");
+-  }
+-  if (pid == 0) {
+-    count = 0;
+-    sigalarm(2, slow_handler);
+-    for(i = 0; i < 1000*500000; i++){
+-      if((i % 1000000) == 0)
+-        write(2, ".", 1);
+-      if(count > 0)
+-        break;
+-    }
+-    if (count == 0) {
+-      printf("\ntest2 failed: alarm not called\n");
+-      exit(1);
+-    }
+-    exit(0);
+-  }
+-  wait(&status);
+-  if (status == 0) {
+-    printf("test2 passed\n");
+-  }
+-}
+-
+-void
+-slow_handler()
+-{
+-  count++;
+-  printf("alarm!\n");
+-  if (count > 1) {
+-    printf("test2 failed: alarm handler called more than once\n");
+-    exit(1);
+-  }
+-  for (int i = 0; i < 1000*500000; i++) {
+-    asm volatile("nop"); // avoid compiler optimizing away loop
+-  }
+-  sigalarm(0, 0);
+-  sigreturn();
+-}
++//
++// test program for the alarm lab.
++// you can modify this file for testing,
++// but please make sure your kernel
++// modifications pass the original
++// versions of these tests.
++//
++
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/riscv.h"
++#include "user/user.h"
++
++void test0();
++void test1();
++void test2();
++void periodic();
++void slow_handler();
++
++int
++main(int argc, char *argv[])
++{
++  test0();
++  test1();
++  test2();
++  exit(0);
++}
++
++volatile static int count;
++
++void
++periodic()
++{
++  count = count + 1;
++  printf("alarm!\n");
++  sigreturn();
++}
++
++// tests whether the kernel calls
++// the alarm handler even a single time.
++void
++test0()
++{
++  int i;
++  printf("test0 start\n");
++  count = 0;
++  sigalarm(2, periodic);
++  for(i = 0; i < 1000*500000; i++){
++    if((i % 1000000) == 0)
++      write(2, ".", 1);
++    if(count > 0)
++      break;
++  }
++  sigalarm(0, 0);
++  if(count > 0){
++    printf("test0 passed\n");
++  } else {
++    printf("\ntest0 failed: the kernel never called the alarm handler\n");
++  }
++}
++
++void __attribute__ ((noinline)) foo(int i, int *j) {
++  if((i % 2500000) == 0) {
++    write(2, ".", 1);
++  }
++  *j += 1;
++}
++
++//
++// tests that the kernel calls the handler multiple times.
++//
++// tests that, when the handler returns, it returns to
++// the point in the program where the timer interrupt
++// occurred, with all registers holding the same values they
++// held when the interrupt occurred.
++//
++void
++test1()
++{
++  int i;
++  int j;
++
++  printf("test1 start\n");
++  count = 0;
++  j = 0;
++  sigalarm(2, periodic);
++  for(i = 0; i < 500000000; i++){
++    if(count >= 10)
++      break;
++    foo(i, &j);
++  }
++  if(count < 10){
++    printf("\ntest1 failed: too few calls to the handler\n");
++  } else if(i != j){
++    // the loop should have called foo() i times, and foo() should
++    // have incremented j once per call, so j should equal i.
++    // once possible source of errors is that the handler may
++    // return somewhere other than where the timer interrupt
++    // occurred; another is that that registers may not be
++    // restored correctly, causing i or j or the address ofj
++    // to get an incorrect value.
++    printf("\ntest1 failed: foo() executed fewer times than it was called\n");
++  } else {
++    printf("test1 passed\n");
++  }
++}
++
++//
++// tests that kernel does not allow reentrant alarm calls.
++void
++test2()
++{
++  int i;
++  int pid;
++  int status;
++
++  printf("test2 start\n");
++  if ((pid = fork()) < 0) {
++    printf("test2: fork failed\n");
++  }
++  if (pid == 0) {
++    count = 0;
++    sigalarm(2, slow_handler);
++    for(i = 0; i < 1000*500000; i++){
++      if((i % 1000000) == 0)
++        write(2, ".", 1);
++      if(count > 0)
++        break;
++    }
++    if (count == 0) {
++      printf("\ntest2 failed: alarm not called\n");
++      exit(1);
++    }
++    exit(0);
++  }
++  wait(&status);
++  if (status == 0) {
++    printf("test2 passed\n");
++  }
++}
++
++void
++slow_handler()
++{
++  count++;
++  printf("alarm!\n");
++  if (count > 1) {
++    printf("test2 failed: alarm handler called more than once\n");
++    exit(1);
++  }
++  for (int i = 0; i < 1000*500000; i++) {
++    asm volatile("nop"); // avoid compiler optimizing away loop
++  }
++  sigalarm(0, 0);
++  sigreturn();
++}
+diff --git a/user/bttest.c b/user/bttest.c
+index 05405f9..52c0ad0 100644
+--- a/user/bttest.c
++++ b/user/bttest.c
+@@ -1,10 +1,10 @@
+-#include "kernel/types.h"
+-#include "kernel/stat.h"
+-#include "user/user.h"
+-
+-int
+-main(int argc, char *argv[])
+-{
+-  sleep(1);
+-  exit(0);
+-}
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int
++main(int argc, char *argv[])
++{
++  sleep(1);
++  exit(0);
++}
+diff --git a/user/call.c b/user/call.c
+index f725dcb..c002e1e 100644
+--- a/user/call.c
++++ b/user/call.c
+@@ -1,17 +1,17 @@
+-#include "kernel/param.h"
+-#include "kernel/types.h"
+-#include "kernel/stat.h"
+-#include "user/user.h"
+-
+-int g(int x) {
+-  return x+3;
+-}
+-
+-int f(int x) {
+-  return g(x);
+-}
+-
+-void main(void) {
+-  printf("%d %d\n", f(8)+1, 13);
+-  exit(0);
+-}
++#include "kernel/param.h"
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int g(int x) {
++  return x+3;
++}
++
++int f(int x) {
++  return g(x);
++}
++
++void main(void) {
++  printf("%d %d\n", f(8)+1, 13);
++  exit(0);
++}
+diff --git a/user/sh.c b/user/sh.c
+index 83dd513..fc54135 100644
+--- a/user/sh.c
++++ b/user/sh.c
+@@ -1,493 +1,493 @@
+-// Shell.
+-
+-#include "kernel/types.h"
+-#include "user/user.h"
+-#include "kernel/fcntl.h"
+-
+-// Parsed command representation
+-#define EXEC  1
+-#define REDIR 2
+-#define PIPE  3
+-#define LIST  4
+-#define BACK  5
+-
+-#define MAXARGS 10
+-
+-struct cmd {
+-  int type;
+-};
+-
+-struct execcmd {
+-  int type;
+-  char *argv[MAXARGS];
+-  char *eargv[MAXARGS];
+-};
+-
+-struct redircmd {
+-  int type;
+-  struct cmd *cmd;
+-  char *file;
+-  char *efile;
+-  int mode;
+-  int fd;
+-};
+-
+-struct pipecmd {
+-  int type;
+-  struct cmd *left;
+-  struct cmd *right;
+-};
+-
+-struct listcmd {
+-  int type;
+-  struct cmd *left;
+-  struct cmd *right;
+-};
+-
+-struct backcmd {
+-  int type;
+-  struct cmd *cmd;
+-};
+-
+-int fork1(void);  // Fork but panics on failure.
+-void panic(char*);
+-struct cmd *parsecmd(char*);
+-
+-// Execute cmd.  Never returns.
+-void
+-runcmd(struct cmd *cmd)
+-{
+-  int p[2];
+-  struct backcmd *bcmd;
+-  struct execcmd *ecmd;
+-  struct listcmd *lcmd;
+-  struct pipecmd *pcmd;
+-  struct redircmd *rcmd;
+-
+-  if(cmd == 0)
+-    exit(1);
+-
+-  switch(cmd->type){
+-  default:
+-    panic("runcmd");
+-
+-  case EXEC:
+-    ecmd = (struct execcmd*)cmd;
+-    if(ecmd->argv[0] == 0)
+-      exit(1);
+-    exec(ecmd->argv[0], ecmd->argv);
+-    fprintf(2, "exec %s failed\n", ecmd->argv[0]);
+-    break;
+-
+-  case REDIR:
+-    rcmd = (struct redircmd*)cmd;
+-    close(rcmd->fd);
+-    if(open(rcmd->file, rcmd->mode) < 0){
+-      fprintf(2, "open %s failed\n", rcmd->file);
+-      exit(1);
+-    }
+-    runcmd(rcmd->cmd);
+-    break;
+-
+-  case LIST:
+-    lcmd = (struct listcmd*)cmd;
+-    if(fork1() == 0)
+-      runcmd(lcmd->left);
+-    wait(0);
+-    runcmd(lcmd->right);
+-    break;
+-
+-  case PIPE:
+-    pcmd = (struct pipecmd*)cmd;
+-    if(pipe(p) < 0)
+-      panic("pipe");
+-    if(fork1() == 0){
+-      close(1);
+-      dup(p[1]);
+-      close(p[0]);
+-      close(p[1]);
+-      runcmd(pcmd->left);
+-    }
+-    if(fork1() == 0){
+-      close(0);
+-      dup(p[0]);
+-      close(p[0]);
+-      close(p[1]);
+-      runcmd(pcmd->right);
+-    }
+-    close(p[0]);
+-    close(p[1]);
+-    wait(0);
+-    wait(0);
+-    break;
+-
+-  case BACK:
+-    bcmd = (struct backcmd*)cmd;
+-    if(fork1() == 0)
+-      runcmd(bcmd->cmd);
+-    break;
+-  }
+-  exit(0);
+-}
+-
+-int
+-getcmd(char *buf, int nbuf)
+-{
+-  fprintf(2, "$ ");
+-  memset(buf, 0, nbuf);
+-  gets(buf, nbuf);
+-  if(buf[0] == 0) // EOF
+-    return -1;
+-  return 0;
+-}
+-
+-int
+-main(void)
+-{
+-  static char buf[100];
+-  int fd;
+-
+-  // Ensure that three file descriptors are open.
+-  while((fd = open("console", O_RDWR)) >= 0){
+-    if(fd >= 3){
+-      close(fd);
+-      break;
+-    }
+-  }
+-
+-  // Read and run input commands.
+-  while(getcmd(buf, sizeof(buf)) >= 0){
+-    if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
+-      // Chdir must be called by the parent, not the child.
+-      buf[strlen(buf)-1] = 0;  // chop \n
+-      if(chdir(buf+3) < 0)
+-        fprintf(2, "cannot cd %s\n", buf+3);
+-      continue;
+-    }
+-    if(fork1() == 0)
+-      runcmd(parsecmd(buf));
+-    wait(0);
+-  }
+-  exit(0);
+-}
+-
+-void
+-panic(char *s)
+-{
+-  fprintf(2, "%s\n", s);
+-  exit(1);
+-}
+-
+-int
+-fork1(void)
+-{
+-  int pid;
+-
+-  pid = fork();
+-  if(pid == -1)
+-    panic("fork");
+-  return pid;
+-}
+-
+-//PAGEBREAK!
+-// Constructors
+-
+-struct cmd*
+-execcmd(void)
+-{
+-  struct execcmd *cmd;
+-
+-  cmd = malloc(sizeof(*cmd));
+-  memset(cmd, 0, sizeof(*cmd));
+-  cmd->type = EXEC;
+-  return (struct cmd*)cmd;
+-}
+-
+-struct cmd*
+-redircmd(struct cmd *subcmd, char *file, char *efile, int mode, int fd)
+-{
+-  struct redircmd *cmd;
+-
+-  cmd = malloc(sizeof(*cmd));
+-  memset(cmd, 0, sizeof(*cmd));
+-  cmd->type = REDIR;
+-  cmd->cmd = subcmd;
+-  cmd->file = file;
+-  cmd->efile = efile;
+-  cmd->mode = mode;
+-  cmd->fd = fd;
+-  return (struct cmd*)cmd;
+-}
+-
+-struct cmd*
+-pipecmd(struct cmd *left, struct cmd *right)
+-{
+-  struct pipecmd *cmd;
+-
+-  cmd = malloc(sizeof(*cmd));
+-  memset(cmd, 0, sizeof(*cmd));
+-  cmd->type = PIPE;
+-  cmd->left = left;
+-  cmd->right = right;
+-  return (struct cmd*)cmd;
+-}
+-
+-struct cmd*
+-listcmd(struct cmd *left, struct cmd *right)
+-{
+-  struct listcmd *cmd;
+-
+-  cmd = malloc(sizeof(*cmd));
+-  memset(cmd, 0, sizeof(*cmd));
+-  cmd->type = LIST;
+-  cmd->left = left;
+-  cmd->right = right;
+-  return (struct cmd*)cmd;
+-}
+-
+-struct cmd*
+-backcmd(struct cmd *subcmd)
+-{
+-  struct backcmd *cmd;
+-
+-  cmd = malloc(sizeof(*cmd));
+-  memset(cmd, 0, sizeof(*cmd));
+-  cmd->type = BACK;
+-  cmd->cmd = subcmd;
+-  return (struct cmd*)cmd;
+-}
+-//PAGEBREAK!
+-// Parsing
+-
+-char whitespace[] = " \t\r\n\v";
+-char symbols[] = "<|>&;()";
+-
+-int
+-gettoken(char **ps, char *es, char **q, char **eq)
+-{
+-  char *s;
+-  int ret;
+-
+-  s = *ps;
+-  while(s < es && strchr(whitespace, *s))
+-    s++;
+-  if(q)
+-    *q = s;
+-  ret = *s;
+-  switch(*s){
+-  case 0:
+-    break;
+-  case '|':
+-  case '(':
+-  case ')':
+-  case ';':
+-  case '&':
+-  case '<':
+-    s++;
+-    break;
+-  case '>':
+-    s++;
+-    if(*s == '>'){
+-      ret = '+';
+-      s++;
+-    }
+-    break;
+-  default:
+-    ret = 'a';
+-    while(s < es && !strchr(whitespace, *s) && !strchr(symbols, *s))
+-      s++;
+-    break;
+-  }
+-  if(eq)
+-    *eq = s;
+-
+-  while(s < es && strchr(whitespace, *s))
+-    s++;
+-  *ps = s;
+-  return ret;
+-}
+-
+-int
+-peek(char **ps, char *es, char *toks)
+-{
+-  char *s;
+-
+-  s = *ps;
+-  while(s < es && strchr(whitespace, *s))
+-    s++;
+-  *ps = s;
+-  return *s && strchr(toks, *s);
+-}
+-
+-struct cmd *parseline(char**, char*);
+-struct cmd *parsepipe(char**, char*);
+-struct cmd *parseexec(char**, char*);
+-struct cmd *nulterminate(struct cmd*);
+-
+-struct cmd*
+-parsecmd(char *s)
+-{
+-  char *es;
+-  struct cmd *cmd;
+-
+-  es = s + strlen(s);
+-  cmd = parseline(&s, es);
+-  peek(&s, es, "");
+-  if(s != es){
+-    fprintf(2, "leftovers: %s\n", s);
+-    panic("syntax");
+-  }
+-  nulterminate(cmd);
+-  return cmd;
+-}
+-
+-struct cmd*
+-parseline(char **ps, char *es)
+-{
+-  struct cmd *cmd;
+-
+-  cmd = parsepipe(ps, es);
+-  while(peek(ps, es, "&")){
+-    gettoken(ps, es, 0, 0);
+-    cmd = backcmd(cmd);
+-  }
+-  if(peek(ps, es, ";")){
+-    gettoken(ps, es, 0, 0);
+-    cmd = listcmd(cmd, parseline(ps, es));
+-  }
+-  return cmd;
+-}
+-
+-struct cmd*
+-parsepipe(char **ps, char *es)
+-{
+-  struct cmd *cmd;
+-
+-  cmd = parseexec(ps, es);
+-  if(peek(ps, es, "|")){
+-    gettoken(ps, es, 0, 0);
+-    cmd = pipecmd(cmd, parsepipe(ps, es));
+-  }
+-  return cmd;
+-}
+-
+-struct cmd*
+-parseredirs(struct cmd *cmd, char **ps, char *es)
+-{
+-  int tok;
+-  char *q, *eq;
+-
+-  while(peek(ps, es, "<>")){
+-    tok = gettoken(ps, es, 0, 0);
+-    if(gettoken(ps, es, &q, &eq) != 'a')
+-      panic("missing file for redirection");
+-    switch(tok){
+-    case '<':
+-      cmd = redircmd(cmd, q, eq, O_RDONLY, 0);
+-      break;
+-    case '>':
+-      cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE|O_TRUNC, 1);
+-      break;
+-    case '+':  // >>
+-      cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE, 1);
+-      break;
+-    }
+-  }
+-  return cmd;
+-}
+-
+-struct cmd*
+-parseblock(char **ps, char *es)
+-{
+-  struct cmd *cmd;
+-
+-  if(!peek(ps, es, "("))
+-    panic("parseblock");
+-  gettoken(ps, es, 0, 0);
+-  cmd = parseline(ps, es);
+-  if(!peek(ps, es, ")"))
+-    panic("syntax - missing )");
+-  gettoken(ps, es, 0, 0);
+-  cmd = parseredirs(cmd, ps, es);
+-  return cmd;
+-}
+-
+-struct cmd*
+-parseexec(char **ps, char *es)
+-{
+-  char *q, *eq;
+-  int tok, argc;
+-  struct execcmd *cmd;
+-  struct cmd *ret;
+-
+-  if(peek(ps, es, "("))
+-    return parseblock(ps, es);
+-
+-  ret = execcmd();
+-  cmd = (struct execcmd*)ret;
+-
+-  argc = 0;
+-  ret = parseredirs(ret, ps, es);
+-  while(!peek(ps, es, "|)&;")){
+-    if((tok=gettoken(ps, es, &q, &eq)) == 0)
+-      break;
+-    if(tok != 'a')
+-      panic("syntax");
+-    cmd->argv[argc] = q;
+-    cmd->eargv[argc] = eq;
+-    argc++;
+-    if(argc >= MAXARGS)
+-      panic("too many args");
+-    ret = parseredirs(ret, ps, es);
+-  }
+-  cmd->argv[argc] = 0;
+-  cmd->eargv[argc] = 0;
+-  return ret;
+-}
+-
+-// NUL-terminate all the counted strings.
+-struct cmd*
+-nulterminate(struct cmd *cmd)
+-{
+-  int i;
+-  struct backcmd *bcmd;
+-  struct execcmd *ecmd;
+-  struct listcmd *lcmd;
+-  struct pipecmd *pcmd;
+-  struct redircmd *rcmd;
+-
+-  if(cmd == 0)
+-    return 0;
+-
+-  switch(cmd->type){
+-  case EXEC:
+-    ecmd = (struct execcmd*)cmd;
+-    for(i=0; ecmd->argv[i]; i++)
+-      *ecmd->eargv[i] = 0;
+-    break;
+-
+-  case REDIR:
+-    rcmd = (struct redircmd*)cmd;
+-    nulterminate(rcmd->cmd);
+-    *rcmd->efile = 0;
+-    break;
+-
+-  case PIPE:
+-    pcmd = (struct pipecmd*)cmd;
+-    nulterminate(pcmd->left);
+-    nulterminate(pcmd->right);
+-    break;
+-
+-  case LIST:
+-    lcmd = (struct listcmd*)cmd;
+-    nulterminate(lcmd->left);
+-    nulterminate(lcmd->right);
+-    break;
+-
+-  case BACK:
+-    bcmd = (struct backcmd*)cmd;
+-    nulterminate(bcmd->cmd);
+-    break;
+-  }
+-  return cmd;
+-}
++// Shell.
++
++#include "kernel/types.h"
++#include "user/user.h"
++#include "kernel/fcntl.h"
++
++// Parsed command representation
++#define EXEC  1
++#define REDIR 2
++#define PIPE  3
++#define LIST  4
++#define BACK  5
++
++#define MAXARGS 10
++
++struct cmd {
++  int type;
++};
++
++struct execcmd {
++  int type;
++  char *argv[MAXARGS];
++  char *eargv[MAXARGS];
++};
++
++struct redircmd {
++  int type;
++  struct cmd *cmd;
++  char *file;
++  char *efile;
++  int mode;
++  int fd;
++};
++
++struct pipecmd {
++  int type;
++  struct cmd *left;
++  struct cmd *right;
++};
++
++struct listcmd {
++  int type;
++  struct cmd *left;
++  struct cmd *right;
++};
++
++struct backcmd {
++  int type;
++  struct cmd *cmd;
++};
++
++int fork1(void);  // Fork but panics on failure.
++void panic(char*);
++struct cmd *parsecmd(char*);
++
++// Execute cmd.  Never returns.
++void
++runcmd(struct cmd *cmd)
++{
++  int p[2];
++  struct backcmd *bcmd;
++  struct execcmd *ecmd;
++  struct listcmd *lcmd;
++  struct pipecmd *pcmd;
++  struct redircmd *rcmd;
++
++  if(cmd == 0)
++    exit(1);
++
++  switch(cmd->type){
++  default:
++    panic("runcmd");
++
++  case EXEC:
++    ecmd = (struct execcmd*)cmd;
++    if(ecmd->argv[0] == 0)
++      exit(1);
++    exec(ecmd->argv[0], ecmd->argv);
++    fprintf(2, "exec %s failed\n", ecmd->argv[0]);
++    break;
++
++  case REDIR:
++    rcmd = (struct redircmd*)cmd;
++    close(rcmd->fd);
++    if(open(rcmd->file, rcmd->mode) < 0){
++      fprintf(2, "open %s failed\n", rcmd->file);
++      exit(1);
++    }
++    runcmd(rcmd->cmd);
++    break;
++
++  case LIST:
++    lcmd = (struct listcmd*)cmd;
++    if(fork1() == 0)
++      runcmd(lcmd->left);
++    wait(0);
++    runcmd(lcmd->right);
++    break;
++
++  case PIPE:
++    pcmd = (struct pipecmd*)cmd;
++    if(pipe(p) < 0)
++      panic("pipe");
++    if(fork1() == 0){
++      close(1);
++      dup(p[1]);
++      close(p[0]);
++      close(p[1]);
++      runcmd(pcmd->left);
++    }
++    if(fork1() == 0){
++      close(0);
++      dup(p[0]);
++      close(p[0]);
++      close(p[1]);
++      runcmd(pcmd->right);
++    }
++    close(p[0]);
++    close(p[1]);
++    wait(0);
++    wait(0);
++    break;
++
++  case BACK:
++    bcmd = (struct backcmd*)cmd;
++    if(fork1() == 0)
++      runcmd(bcmd->cmd);
++    break;
++  }
++  exit(0);
++}
++
++int
++getcmd(char *buf, int nbuf)
++{
++  fprintf(2, "$ ");
++  memset(buf, 0, nbuf);
++  gets(buf, nbuf);
++  if(buf[0] == 0) // EOF
++    return -1;
++  return 0;
++}
++
++int
++main(void)
++{
++  static char buf[100];
++  int fd;
++
++  // Ensure that three file descriptors are open.
++  while((fd = open("console", O_RDWR)) >= 0){
++    if(fd >= 3){
++      close(fd);
++      break;
++    }
++  }
++
++  // Read and run input commands.
++  while(getcmd(buf, sizeof(buf)) >= 0){
++    if(buf[0] == 'c' && buf[1] == 'd' && buf[2] == ' '){
++      // Chdir must be called by the parent, not the child.
++      buf[strlen(buf)-1] = 0;  // chop \n
++      if(chdir(buf+3) < 0)
++        fprintf(2, "cannot cd %s\n", buf+3);
++      continue;
++    }
++    if(fork1() == 0)
++      runcmd(parsecmd(buf));
++    wait(0);
++  }
++  exit(0);
++}
++
++void
++panic(char *s)
++{
++  fprintf(2, "%s\n", s);
++  exit(1);
++}
++
++int
++fork1(void)
++{
++  int pid;
++
++  pid = fork();
++  if(pid == -1)
++    panic("fork");
++  return pid;
++}
++
++//PAGEBREAK!
++// Constructors
++
++struct cmd*
++execcmd(void)
++{
++  struct execcmd *cmd;
++
++  cmd = malloc(sizeof(*cmd));
++  memset(cmd, 0, sizeof(*cmd));
++  cmd->type = EXEC;
++  return (struct cmd*)cmd;
++}
++
++struct cmd*
++redircmd(struct cmd *subcmd, char *file, char *efile, int mode, int fd)
++{
++  struct redircmd *cmd;
++
++  cmd = malloc(sizeof(*cmd));
++  memset(cmd, 0, sizeof(*cmd));
++  cmd->type = REDIR;
++  cmd->cmd = subcmd;
++  cmd->file = file;
++  cmd->efile = efile;
++  cmd->mode = mode;
++  cmd->fd = fd;
++  return (struct cmd*)cmd;
++}
++
++struct cmd*
++pipecmd(struct cmd *left, struct cmd *right)
++{
++  struct pipecmd *cmd;
++
++  cmd = malloc(sizeof(*cmd));
++  memset(cmd, 0, sizeof(*cmd));
++  cmd->type = PIPE;
++  cmd->left = left;
++  cmd->right = right;
++  return (struct cmd*)cmd;
++}
++
++struct cmd*
++listcmd(struct cmd *left, struct cmd *right)
++{
++  struct listcmd *cmd;
++
++  cmd = malloc(sizeof(*cmd));
++  memset(cmd, 0, sizeof(*cmd));
++  cmd->type = LIST;
++  cmd->left = left;
++  cmd->right = right;
++  return (struct cmd*)cmd;
++}
++
++struct cmd*
++backcmd(struct cmd *subcmd)
++{
++  struct backcmd *cmd;
++
++  cmd = malloc(sizeof(*cmd));
++  memset(cmd, 0, sizeof(*cmd));
++  cmd->type = BACK;
++  cmd->cmd = subcmd;
++  return (struct cmd*)cmd;
++}
++//PAGEBREAK!
++// Parsing
++
++char whitespace[] = " \t\r\n\v";
++char symbols[] = "<|>&;()";
++
++int
++gettoken(char **ps, char *es, char **q, char **eq)
++{
++  char *s;
++  int ret;
++
++  s = *ps;
++  while(s < es && strchr(whitespace, *s))
++    s++;
++  if(q)
++    *q = s;
++  ret = *s;
++  switch(*s){
++  case 0:
++    break;
++  case '|':
++  case '(':
++  case ')':
++  case ';':
++  case '&':
++  case '<':
++    s++;
++    break;
++  case '>':
++    s++;
++    if(*s == '>'){
++      ret = '+';
++      s++;
++    }
++    break;
++  default:
++    ret = 'a';
++    while(s < es && !strchr(whitespace, *s) && !strchr(symbols, *s))
++      s++;
++    break;
++  }
++  if(eq)
++    *eq = s;
++
++  while(s < es && strchr(whitespace, *s))
++    s++;
++  *ps = s;
++  return ret;
++}
++
++int
++peek(char **ps, char *es, char *toks)
++{
++  char *s;
++
++  s = *ps;
++  while(s < es && strchr(whitespace, *s))
++    s++;
++  *ps = s;
++  return *s && strchr(toks, *s);
++}
++
++struct cmd *parseline(char**, char*);
++struct cmd *parsepipe(char**, char*);
++struct cmd *parseexec(char**, char*);
++struct cmd *nulterminate(struct cmd*);
++
++struct cmd*
++parsecmd(char *s)
++{
++  char *es;
++  struct cmd *cmd;
++
++  es = s + strlen(s);
++  cmd = parseline(&s, es);
++  peek(&s, es, "");
++  if(s != es){
++    fprintf(2, "leftovers: %s\n", s);
++    panic("syntax");
++  }
++  nulterminate(cmd);
++  return cmd;
++}
++
++struct cmd*
++parseline(char **ps, char *es)
++{
++  struct cmd *cmd;
++
++  cmd = parsepipe(ps, es);
++  while(peek(ps, es, "&")){
++    gettoken(ps, es, 0, 0);
++    cmd = backcmd(cmd);
++  }
++  if(peek(ps, es, ";")){
++    gettoken(ps, es, 0, 0);
++    cmd = listcmd(cmd, parseline(ps, es));
++  }
++  return cmd;
++}
++
++struct cmd*
++parsepipe(char **ps, char *es)
++{
++  struct cmd *cmd;
++
++  cmd = parseexec(ps, es);
++  if(peek(ps, es, "|")){
++    gettoken(ps, es, 0, 0);
++    cmd = pipecmd(cmd, parsepipe(ps, es));
++  }
++  return cmd;
++}
++
++struct cmd*
++parseredirs(struct cmd *cmd, char **ps, char *es)
++{
++  int tok;
++  char *q, *eq;
++
++  while(peek(ps, es, "<>")){
++    tok = gettoken(ps, es, 0, 0);
++    if(gettoken(ps, es, &q, &eq) != 'a')
++      panic("missing file for redirection");
++    switch(tok){
++    case '<':
++      cmd = redircmd(cmd, q, eq, O_RDONLY, 0);
++      break;
++    case '>':
++      cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE|O_TRUNC, 1);
++      break;
++    case '+':  // >>
++      cmd = redircmd(cmd, q, eq, O_WRONLY|O_CREATE, 1);
++      break;
++    }
++  }
++  return cmd;
++}
++
++struct cmd*
++parseblock(char **ps, char *es)
++{
++  struct cmd *cmd;
++
++  if(!peek(ps, es, "("))
++    panic("parseblock");
++  gettoken(ps, es, 0, 0);
++  cmd = parseline(ps, es);
++  if(!peek(ps, es, ")"))
++    panic("syntax - missing )");
++  gettoken(ps, es, 0, 0);
++  cmd = parseredirs(cmd, ps, es);
++  return cmd;
++}
++
++struct cmd*
++parseexec(char **ps, char *es)
++{
++  char *q, *eq;
++  int tok, argc;
++  struct execcmd *cmd;
++  struct cmd *ret;
++
++  if(peek(ps, es, "("))
++    return parseblock(ps, es);
++
++  ret = execcmd();
++  cmd = (struct execcmd*)ret;
++
++  argc = 0;
++  ret = parseredirs(ret, ps, es);
++  while(!peek(ps, es, "|)&;")){
++    if((tok=gettoken(ps, es, &q, &eq)) == 0)
++      break;
++    if(tok != 'a')
++      panic("syntax");
++    cmd->argv[argc] = q;
++    cmd->eargv[argc] = eq;
++    argc++;
++    if(argc >= MAXARGS)
++      panic("too many args");
++    ret = parseredirs(ret, ps, es);
++  }
++  cmd->argv[argc] = 0;
++  cmd->eargv[argc] = 0;
++  return ret;
++}
++
++// NUL-terminate all the counted strings.
++struct cmd*
++nulterminate(struct cmd *cmd)
++{
++  int i;
++  struct backcmd *bcmd;
++  struct execcmd *ecmd;
++  struct listcmd *lcmd;
++  struct pipecmd *pcmd;
++  struct redircmd *rcmd;
++
++  if(cmd == 0)
++    return 0;
++
++  switch(cmd->type){
++  case EXEC:
++    ecmd = (struct execcmd*)cmd;
++    for(i=0; ecmd->argv[i]; i++)
++      *ecmd->eargv[i] = 0;
++    break;
++
++  case REDIR:
++    rcmd = (struct redircmd*)cmd;
++    nulterminate(rcmd->cmd);
++    *rcmd->efile = 0;
++    break;
++
++  case PIPE:
++    pcmd = (struct pipecmd*)cmd;
++    nulterminate(pcmd->left);
++    nulterminate(pcmd->right);
++    break;
++
++  case LIST:
++    lcmd = (struct listcmd*)cmd;
++    nulterminate(lcmd->left);
++    nulterminate(lcmd->right);
++    break;
++
++  case BACK:
++    bcmd = (struct backcmd*)cmd;
++    nulterminate(bcmd->cmd);
++    break;
++  }
++  return cmd;
++}
+diff --git a/user/ulib.c b/user/ulib.c
+index 4775939..df643a3 100644
+--- a/user/ulib.c
++++ b/user/ulib.c
+@@ -1,136 +1,136 @@
+-#include "kernel/types.h"
+-#include "kernel/stat.h"
+-#include "kernel/fcntl.h"
+-#include "user/user.h"
+-
+-char*
+-strcpy(char *s, const char *t)
+-{
+-  char *os;
+-
+-  os = s;
+-  while((*s++ = *t++) != 0)
+-    ;
+-  return os;
+-}
+-
+-int
+-strcmp(const char *p, const char *q)
+-{
+-  while(*p && *p == *q)
+-    p++, q++;
+-  return (uchar)*p - (uchar)*q;
+-}
+-
+-uint
+-strlen(const char *s)
+-{
+-  int n;
+-
+-  for(n = 0; s[n]; n++)
+-    ;
+-  return n;
+-}
+-
+-void*
+-memset(void *dst, int c, uint n)
+-{
+-  char *cdst = (char *) dst;
+-  int i;
+-  for(i = 0; i < n; i++){
+-    cdst[i] = c;
+-  }
+-  return dst;
+-}
+-
+-char*
+-strchr(const char *s, char c)
+-{
+-  for(; *s; s++)
+-    if(*s == c)
+-      return (char*)s;
+-  return 0;
+-}
+-
+-char*
+-gets(char *buf, int max)
+-{
+-  int i, cc;
+-  char c;
+-
+-  for(i=0; i+1 < max; ){
+-    cc = read(0, &c, 1);
+-    if(cc < 1)
+-      break;
+-    buf[i++] = c;
+-    if(c == '\n' || c == '\r')
+-      break;
+-  }
+-  buf[i] = '\0';
+-  return buf;
+-}
+-
+-int
+-stat(const char *n, struct stat *st)
+-{
+-  int fd;
+-  int r;
+-
+-  fd = open(n, O_RDONLY);
+-  if(fd < 0)
+-    return -1;
+-  r = fstat(fd, st);
+-  close(fd);
+-  return r;
+-}
+-
+-int
+-atoi(const char *s)
+-{
+-  int n;
+-
+-  n = 0;
+-  while('0' <= *s && *s <= '9')
+-    n = n*10 + *s++ - '0';
+-  return n;
+-}
+-
+-void*
+-memmove(void *vdst, const void *vsrc, int n)
+-{
+-  char *dst;
+-  const char *src;
+-
+-  dst = vdst;
+-  src = vsrc;
+-  if (src > dst) {
+-    while(n-- > 0)
+-      *dst++ = *src++;
+-  } else {
+-    dst += n;
+-    src += n;
+-    while(n-- > 0)
+-      *--dst = *--src;
+-  }
+-  return vdst;
+-}
+-
+-int
+-memcmp(const void *s1, const void *s2, uint n)
+-{
+-  const char *p1 = s1, *p2 = s2;
+-  while (n-- > 0) {
+-    if (*p1 != *p2) {
+-      return *p1 - *p2;
+-    }
+-    p1++;
+-    p2++;
+-  }
+-  return 0;
+-}
+-
+-void *
+-memcpy(void *dst, const void *src, uint n)
+-{
+-  return memmove(dst, src, n);
+-}
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "kernel/fcntl.h"
++#include "user/user.h"
++
++char*
++strcpy(char *s, const char *t)
++{
++  char *os;
++
++  os = s;
++  while((*s++ = *t++) != 0)
++    ;
++  return os;
++}
++
++int
++strcmp(const char *p, const char *q)
++{
++  while(*p && *p == *q)
++    p++, q++;
++  return (uchar)*p - (uchar)*q;
++}
++
++uint
++strlen(const char *s)
++{
++  int n;
++
++  for(n = 0; s[n]; n++)
++    ;
++  return n;
++}
++
++void*
++memset(void *dst, int c, uint n)
++{
++  char *cdst = (char *) dst;
++  int i;
++  for(i = 0; i < n; i++){
++    cdst[i] = c;
++  }
++  return dst;
++}
++
++char*
++strchr(const char *s, char c)
++{
++  for(; *s; s++)
++    if(*s == c)
++      return (char*)s;
++  return 0;
++}
++
++char*
++gets(char *buf, int max)
++{
++  int i, cc;
++  char c;
++
++  for(i=0; i+1 < max; ){
++    cc = read(0, &c, 1);
++    if(cc < 1)
++      break;
++    buf[i++] = c;
++    if(c == '\n' || c == '\r')
++      break;
++  }
++  buf[i] = '\0';
++  return buf;
++}
++
++int
++stat(const char *n, struct stat *st)
++{
++  int fd;
++  int r;
++
++  fd = open(n, O_RDONLY);
++  if(fd < 0)
++    return -1;
++  r = fstat(fd, st);
++  close(fd);
++  return r;
++}
++
++int
++atoi(const char *s)
++{
++  int n;
++
++  n = 0;
++  while('0' <= *s && *s <= '9')
++    n = n*10 + *s++ - '0';
++  return n;
++}
++
++void*
++memmove(void *vdst, const void *vsrc, int n)
++{
++  char *dst;
++  const char *src;
++
++  dst = vdst;
++  src = vsrc;
++  if (src > dst) {
++    while(n-- > 0)
++      *dst++ = *src++;
++  } else {
++    dst += n;
++    src += n;
++    while(n-- > 0)
++      *--dst = *--src;
++  }
++  return vdst;
++}
++
++int
++memcmp(const void *s1, const void *s2, uint n)
++{
++  const char *p1 = s1, *p2 = s2;
++  while (n-- > 0) {
++    if (*p1 != *p2) {
++      return *p1 - *p2;
++    }
++    p1++;
++    p2++;
++  }
++  return 0;
++}
++
++void *
++memcpy(void *dst, const void *src, uint n)
++{
++  return memmove(dst, src, n);
++}
+diff --git a/user/user.h b/user/user.h
+index b71ecda..7c0156c 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -1,42 +1,44 @@
+-struct stat;
+-struct rtcdate;
+-
+-// system calls
+-int fork(void);
+-int exit(int) __attribute__((noreturn));
+-int wait(int*);
+-int pipe(int*);
+-int write(int, const void*, int);
+-int read(int, void*, int);
+-int close(int);
+-int kill(int);
+-int exec(char*, char**);
+-int open(const char*, int);
+-int mknod(const char*, short, short);
+-int unlink(const char*);
+-int fstat(int fd, struct stat*);
+-int link(const char*, const char*);
+-int mkdir(const char*);
+-int chdir(const char*);
+-int dup(int);
+-int getpid(void);
+-char* sbrk(int);
+-int sleep(int);
+-int uptime(void);
+-
+-// ulib.c
+-int stat(const char*, struct stat*);
+-char* strcpy(char*, const char*);
+-void *memmove(void*, const void*, int);
+-char* strchr(const char*, char c);
+-int strcmp(const char*, const char*);
+-void fprintf(int, const char*, ...);
+-void printf(const char*, ...);
+-char* gets(char*, int max);
+-uint strlen(const char*);
+-void* memset(void*, int, uint);
+-void* malloc(uint);
+-void free(void*);
+-int atoi(const char*);
+-int memcmp(const void *, const void *, uint);
+-void *memcpy(void *, const void *, uint);
++struct stat;
++struct rtcdate;
++
++// system calls
++int fork(void);
++int exit(int) __attribute__((noreturn));
++int wait(int*);
++int pipe(int*);
++int write(int, const void*, int);
++int read(int, void*, int);
++int close(int);
++int kill(int);
++int exec(char*, char**);
++int open(const char*, int);
++int mknod(const char*, short, short);
++int unlink(const char*);
++int fstat(int fd, struct stat*);
++int link(const char*, const char*);
++int mkdir(const char*);
++int chdir(const char*);
++int dup(int);
++int getpid(void);
++char* sbrk(int);
++int sleep(int);
++int uptime(void);
++int sigalarm(int ticks, void (*handler)());
++int sigreturn(void);
++
++// ulib.c
++int stat(const char*, struct stat*);
++char* strcpy(char*, const char*);
++void *memmove(void*, const void*, int);
++char* strchr(const char*, char c);
++int strcmp(const char*, const char*);
++void fprintf(int, const char*, ...);
++void printf(const char*, ...);
++char* gets(char*, int max);
++uint strlen(const char*);
++void* memset(void*, int, uint);
++void* malloc(uint);
++void free(void*);
++int atoi(const char*);
++int memcmp(const void *, const void *, uint);
++void *memcpy(void *, const void *, uint);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..12cdbdb 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -1,38 +1,41 @@
+-#!/usr/bin/perl -w
+-
+-# Generate usys.S, the stubs for syscalls.
+-
+-print "# generated by usys.pl - do not edit\n";
+-
+-print "#include \"kernel/syscall.h\"\n";
+-
+-sub entry {
+-    my $name = shift;
+-    print ".global $name\n";
+-    print "${name}:\n";
+-    print " li a7, SYS_${name}\n";
+-    print " ecall\n";
+-    print " ret\n";
+-}
+-	
+-entry("fork");
+-entry("exit");
+-entry("wait");
+-entry("pipe");
+-entry("read");
+-entry("write");
+-entry("close");
+-entry("kill");
+-entry("exec");
+-entry("open");
+-entry("mknod");
+-entry("unlink");
+-entry("fstat");
+-entry("link");
+-entry("mkdir");
+-entry("chdir");
+-entry("dup");
+-entry("getpid");
+-entry("sbrk");
+-entry("sleep");
+-entry("uptime");
++#!/usr/bin/perl -w
++
++# Generate usys.S, the stubs for syscalls.
++
++print "# generated by usys.pl - do not edit\n";
++
++print "#include \"kernel/syscall.h\"\n";
++
++sub entry {
++    my $name = shift;
++    print ".global $name\n";
++    print "${name}:\n";
++    print " li a7, SYS_${name}\n";
++    print " ecall\n";
++    print " ret\n";
++}
++	
++entry("fork");
++entry("exit");
++entry("wait");
++entry("pipe");
++entry("read");
++entry("write");
++entry("close");
++entry("kill");
++entry("exec");
++entry("open");
++entry("mknod");
++entry("unlink");
++entry("fstat");
++entry("link");
++entry("mkdir");
++entry("chdir");
++entry("dup");
++entry("getpid");
++entry("sbrk");
++entry("sleep");
++entry("uptime");
++entry("sigalarm");
++entry("sigreturn");
++
