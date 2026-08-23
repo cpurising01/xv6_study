@@ -1,0 +1,352 @@
+commit 10c4ed38325241bb721b4acb616c7290a8054708
+Author: CPU-rising <cpu@rising.com>
+Date:   Sun Jul 26 14:15:05 2026 +0800
+
+    Finish Lab 10 mmap
+
+diff --git a/Makefile b/Makefile
+index 7a7e380..4845b64 100644
+--- a/Makefile
++++ b/Makefile
+@@ -86,7 +86,7 @@ LD = $(TOOLPREFIX)ld
+ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+ 
+-CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
++CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb -Wno-infinite-recursion
+ 
+ ifdef LAB
+ LABUPPER = $(shell echo $(LAB) | tr a-z A-Z)
+@@ -188,6 +188,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_mmaptest\
+ 
+ 
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 3564db4..d17ba0f 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -167,9 +167,11 @@ void            uvmfree(pagetable_t, uint64);
+ void            uvmunmap(pagetable_t, uint64, uint64, int);
+ void            uvmclear(pagetable_t, uint64);
+ uint64          walkaddr(pagetable_t, uint64);
++pte_t *         walk(pagetable_t, uint64, int);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++uint64          munmap(uint64, int);
+ 
+ // plic.c
+ void            plicinit(void);
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..aa543b1 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -301,6 +301,13 @@ fork(void)
+       np->ofile[i] = filedup(p->ofile[i]);
+   np->cwd = idup(p->cwd);
+ 
++  for(int i = 0; i < MAXVMA; i++){
++    if(p->vma_table[i].mapped){
++      memmove(&np->vma_table[i], &p->vma_table[i], sizeof(struct vma));
++      filedup(np->vma_table[i].f);
++    }
++  }
++
+   safestrcpy(np->name, p->name, sizeof(p->name));
+ 
+   pid = np->pid;
+@@ -353,6 +360,16 @@ exit(int status)
+     }
+   }
+ 
++  struct vma *pvma;
++  for(int i = 0; i < MAXVMA; i++){
++    pvma = &p->vma_table[i];
++    if(pvma->mapped){
++      if(munmap(pvma->addr, pvma->len) < 0){
++        panic("exit munmap");
++      }
++    }
++  }
++
+   begin_op();
+   iput(p->cwd);
+   end_op();
+diff --git a/kernel/proc.h b/kernel/proc.h
+index f6ca8b7..ab12682 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -80,6 +80,17 @@ struct trapframe {
+   /* 280 */ uint64 t6;
+ };
+ 
++#define MAXVMA 16
++struct vma {
++  int mapped;
++  uint64 addr;
++  int len;
++  int prot;
++  int flags;
++  int offset;
++  struct file *f;
++};
++
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
+ // Per-process state
+@@ -105,4 +116,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  struct vma vma_table[MAXVMA];// Table of mapped regions
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index c1b3670..7320633 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -104,6 +104,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_wait(void);
+ extern uint64 sys_write(void);
+ extern uint64 sys_uptime(void);
++extern uint64 sys_mmap(void);
++extern uint64 sys_munmap(void);
+ 
+ static uint64 (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -127,6 +129,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_mmap]    sys_mmap,
++[SYS_munmap]  sys_munmap,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..e7b18d6 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_mmap   22
++#define SYS_munmap 23
+diff --git a/kernel/sysfile.c b/kernel/sysfile.c
+index 5dc453b..0a31327 100644
+--- a/kernel/sysfile.c
++++ b/kernel/sysfile.c
+@@ -484,3 +484,103 @@ sys_pipe(void)
+   }
+   return 0;
+ }
++
++#ifndef min
++#define min(a, b) ((a) < (b) ? (a) : (b))
++#endif
++
++uint64
++sys_mmap(void)
++{
++  struct proc *p = myproc();
++  uint64 addr;
++  int len;
++  int prot;
++  int flags;
++  int offset;
++  struct file *f;
++  if(argaddr(0, &addr) < 0 || argfd(4, 0, &f) < 0){
++    return -1;
++  }
++  if(argint(1, &len) < 0 || argint(2, &prot) < 0 || argint(3, &flags) < 0 || argint(5, &offset) < 0){
++    return -1;
++  }
++  if(!f->writable && (prot & PROT_WRITE) && flags == MAP_SHARED) 
++    return -1;
++  for(int i = 0; i < MAXVMA; i++){
++    if(p->vma_table[i].mapped == 0){
++      p->vma_table[i].mapped = 1;
++      p->vma_table[i].addr = p->sz;
++      p->vma_table[i].len = PGROUNDUP(len);
++      p->vma_table[i].prot = prot;
++      p->vma_table[i].flags = flags;
++      p->vma_table[i].offset = offset;
++      p->vma_table[i].f = filedup(f);
++      p->sz += PGROUNDUP(len);
++      return p->vma_table[i].addr;
++    }
++  }
++  return -1;
++}
++
++uint64
++munmap(uint64 addr, int len){
++  struct proc *p = myproc();
++  struct vma *pvma = 0;
++  int i = 0;
++  for(; i < MAXVMA; i++){
++    if(p->vma_table[i].mapped == 1 && addr >= p->vma_table[i].addr && (addr + len) <= (p->vma_table[i].addr + p->vma_table[i].len)){
++      pvma = &p->vma_table[i];
++      break;
++    }
++  }
++  if(pvma == 0){
++    return -1;
++  }
++  uint64 end = addr + len;
++  uint64 _addr = addr;
++  if((pvma->flags == MAP_SHARED) && pvma->f->writable){
++    uint64 cur = addr;
++    while(cur < end){
++      pte_t *pte = walk(p->pagetable, cur, 0);
++      if(pte && (*pte & PTE_V)){
++        int size = min(end - cur, PGSIZE);
++        begin_op();
++        ilock(pvma->f->ip);
++        if(writei(pvma->f->ip, 1, cur, cur - pvma->addr, size) != size){
++          iunlock(pvma->f->ip);
++          end_op();
++          return -1;
++        }
++        iunlock(pvma->f->ip);
++        end_op();
++      }
++      cur += PGSIZE;
++    }
++  }
++  uvmunmap(p->pagetable, _addr, PGROUNDUP(len) / PGSIZE, 1);
++
++  if(_addr == pvma->addr){
++    pvma->addr += len;
++    pvma->len -= len;
++  }else if(_addr + len == pvma->addr + pvma->len){
++    pvma->len -= len;
++  }
++
++  if(pvma->len == 0 && pvma->mapped == 1){
++    fileclose(pvma->f);
++    pvma->mapped = 0;
++  }
++  return 0;
++}
++
++uint64
++sys_munmap(void)
++{
++  uint64 addr;
++  int len;
++  if(argaddr(0, &addr) < 0 || argint(1, &len) < 0){
++    return -1;
++  }
++  return munmap(addr, len);
++}
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..14a5f2f 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -5,6 +5,9 @@
+ #include "spinlock.h"
+ #include "proc.h"
+ #include "defs.h"
++#include "sleeplock.h"
++#include "fs.h"
++#include "file.h"
+ 
+ struct spinlock tickslock;
+ uint ticks;
+@@ -65,6 +68,39 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
++  } else if(r_scause() == 13 || r_scause() == 15){
++    uint64 va = r_stval();
++    struct vma *pvma = 0;
++    int i = 0;
++    if((va >= p->sz) || (va < PGROUNDDOWN(p->trapframe->sp))){
++      p->killed = 1;
++    } else {
++      va = PGROUNDDOWN(va);
++      for(; i < MAXVMA; i++){
++        pvma = &p->vma_table[i];
++        if(pvma->mapped && va >= pvma->addr && va < pvma->addr + pvma->len){
++          break;
++        }
++      }
++      if(i >= MAXVMA){
++        p->killed = 1;
++      } else {
++        char *mem = kalloc();
++        if(mem == 0){
++          p->killed = 1;
++        } else {
++          memset(mem, 0, PGSIZE);
++          if(mappages(p->pagetable, va, PGSIZE, (uint64)mem, (pvma->prot << 1) | PTE_U) != 0){
++            kfree(mem);
++            p->killed = 1;
++          } else {
++            ilock(pvma->f->ip);
++            readi(pvma->f->ip, 1, va, va - pvma->addr + pvma->offset, PGSIZE);
++            iunlock(pvma->f->ip);
++          }
++        }
++      }
++    }
+   } else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+diff --git a/kernel/vm.c b/kernel/vm.c
+index d5a12a0..5a04e44 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -175,7 +175,7 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+     if((pte = walk(pagetable, a, 0)) == 0)
+       panic("uvmunmap: walk");
+     if((*pte & PTE_V) == 0)
+-      panic("uvmunmap: not mapped");
++      continue;
+     if(PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+     if(do_free){
+@@ -309,7 +309,7 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+     if((pte = walk(old, i, 0)) == 0)
+       panic("uvmcopy: pte should exist");
+     if((*pte & PTE_V) == 0)
+-      panic("uvmcopy: page not present");
++      continue;
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+     if((mem = kalloc()) == 0)
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..00750ed
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++3
+diff --git a/user/user.h b/user/user.h
+index b71ecda..8f8d7a0 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -23,6 +23,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++void* mmap(void*, int, int, int, int, int);
++int munmap(void*, int);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..d23b9cc 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("mmap");
++entry("munmap");
